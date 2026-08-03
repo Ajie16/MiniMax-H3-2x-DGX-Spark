@@ -1,0 +1,13 @@
+MiniMax-H3-2x-DGX-Spark
+Copyright 2026 Joey Rodriguez
+
+This repository includes a compatibility patch against vLLM-Omni, which is
+licensed under the Apache License, Version 2.0:
+https://github.com/vllm-project/vllm-omni
+
+The known-good base image is built by the companion single-Spark repository:
+https://github.com/joeynyc/MiniMax-H3-DGX-Spark
+
+MiniMax H3 model weights and model outputs are not included in this repository.
+They are governed by the separate MiniMax H3 Community License Agreement:
+https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE
