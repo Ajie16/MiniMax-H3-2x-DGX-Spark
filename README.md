@@ -33,40 +33,46 @@ The DiT uses two-way Ulysses sequence parallelism. Both GPUs contribute to the
 same denoising trajectory; rank 0 also owns the encoders, VAE, and final API
 response.
 
-## Measured result
+## Verified results
 
-Verified on the two-Spark lab topology above on August 3, 2026. Two consecutive
-fixed-seed T2VA requests returned fully decodable H.264/AAC MP4 files in 68.783
-and 64.888 seconds. Both GPUs sustained about 96% utilization during denoising,
-and NCCL reported two ranks on two nodes using `NET/IB`.
+The final public-release acceptance ran on August 4, 2026 using the same
+derived image on both nodes:
+`sha256:09e6521356bbbb635048228d30e78a36c65352a48f7620c921d5aeff2d21b90b`
+The first request after each cold start includes lazy regional compilation;
+the second is the warm measurement.
 
-The comparable single-Spark request took 154.956 seconds, so the observed
-client-side speedup was about 2.3x. This is a two-machine lab result, not a
-vendor benchmark or an upstream support guarantee. See
-[the acceptance record](docs/RESULTS.md) for exact settings, hashes, and limits.
+| Profile | Ready from cold | Compile warm-up | Warm request |
+|---|---:|---:|---:|
+| cuDNN + regional compile, full compute | 588.98 s | 70.337 s | 46.574 s |
+| cuDNN + regional compile, balanced Cache-DiT | 584.91 s | 55.412 s | 30.578 s |
 
-The current verified fast profile uses cuDNN diffusion attention and regional
-`torch.compile`. After one compile warm-up, two final acceptance requests took
-47.101 and 50.276 seconds. Their 48.689-second average is 24.2% faster than the
-64.226-second warm Torch-SDPA/eager baseline. FlashAttention 4 was tested and
-rejected after an SM121 CuTe/CUTLASS JIT failure before its first denoising
-step; it is not the default.
+All four fixed-input T2VA requests produced 56-frame, 768x448, 24 fps
+H.264/AAC MP4 files. Complete FFmpeg decoding, non-silent audio, and midpoint
+visual inspection passed. Both GPUs were active during generation, Ray reported
+two healthy nodes, and all three containers remained at zero restarts with no
+OOM state. The API and Ray dashboard listened only on the configured private
+head address.
 
-The same optimization also passed the exact earlier 1344x768, 24 fps,
-50-step, four-second quality workload. End-to-end time fell from 2,281.532
-seconds to 1,353.506 seconds: 40.7% lower latency, or 1.69x the former
-generation rate. The 107-frame H.264/AAC result fully decoded, retained exactly
-five adults throughout sampled-frame inspection, and measured 0.9134 video
-SSIM against the earlier same-seed output. See the acceptance record for the
-quality and bias observations; this is one matched test, not a universal
-quality or performance claim.
+Earlier matched tests established the broader performance and quality results:
 
-An optional balanced Cache-DiT profile was then measured against that exact
-full-compute baseline. At 1344x768 and 50 steps it completed in 608.991 seconds
-(10m 8.991s), 55.0% lower latency and 2.22x the generation rate of the
-1,353.506-second no-cache run. The same-seed cached output measured 0.888 SSIM
-and 27.04 dB average PSNR against full compute, with effectively unchanged
-audio. It is a visually inspected speed/quality tradeoff, not a lossless mode.
+- The first distributed acceptance completed in 68.783 and 64.888 seconds,
+  versus 154.956 seconds for the comparable single-Spark request—about 2.3x
+  faster client-side.
+- cuDNN attention plus regional compilation averaged 48.689 seconds warm,
+  24.2% faster than the 64.226-second warm Torch-SDPA/eager baseline.
+- The 1344x768, 50-step full-compute workload fell from 2,281.532 to
+  1,353.506 seconds. The output fully decoded and measured 0.9134 video SSIM
+  against the earlier same-seed result.
+- The balanced Cache-DiT profile completed that same workload in 608.991
+  seconds—55.0% lower latency and 2.22x the generation rate of full compute.
+  Its same-seed output measured 0.888 SSIM and 27.04 dB average video PSNR
+  against full compute, with effectively unchanged audio.
+
+These are measured results from one two-machine lab, not vendor benchmarks or
+upstream support guarantees. Cache-DiT is a visually inspected speed/quality
+tradeoff, not a lossless mode. See
+[the complete acceptance record](docs/RESULTS.md) for request settings, hashes,
+quality observations, and experimental limits.
 
 ## How one video spans both machines
 
@@ -109,6 +115,7 @@ cp .env.example .env
 make audit
 make build
 ./scripts/start-two-sparks.sh
+./scripts/wait-ready.sh
 make status
 ```
 
@@ -120,11 +127,11 @@ derived image IDs match. The accepted companion commit, upstream digest, local
 base image ID, and exact runtime package versions are recorded in
 [the reproducibility guide](docs/REPRODUCIBILITY.md).
 
-Cold startup took about 8 minutes in the accepted run. Wait for `make status`
-to confirm both Ray nodes, HTTP health, and exact model identity. The API is
-served only on the configured private head-node address on port `8000`;
-synchronous generation uses
-`POST /v1/videos/sync`.
+Cold readiness measured 584.91 to 588.98 seconds in the final acceptance.
+`wait-ready.sh` waits through model loading and then checks both Ray nodes,
+HTTP health, all three containers, and exact model identity. The API is served
+only on the configured private head-node address on port `8000`; synchronous
+generation uses `POST /v1/videos/sync`.
 
 The default fast profile compiles lazily. Treat the first successful request
 after a cold start as warm-up and measure steady-state latency from the second
