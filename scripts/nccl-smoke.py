@@ -14,12 +14,14 @@ WORKER_IP = os.environ.get("H3_WORKER_IP") or os.environ["WORKER_IP"]
 MASTER_PORT = os.environ.get("H3_NCCL_SMOKE_PORT", "29501")
 IFACE = os.environ.get("NCCL_SOCKET_IFNAME", "enp1s0f1np1")
 HCA = os.environ.get("NCCL_IB_HCA", "rocep1s0f1")
-GID = os.environ.get("NCCL_IB_GID_INDEX", "3")
+SHARED_GID = os.environ.get("NCCL_IB_GID_INDEX", "3")
+HEAD_GID = os.environ.get("H3_HEAD_GID_INDEX", SHARED_GID)
+WORKER_GID = os.environ.get("H3_WORKER_GID_INDEX", SHARED_GID)
 
 
 @ray.remote(num_gpus=1)
 class NcclRank:
-    def run(self, rank: int) -> dict[str, object]:
+    def run(self, rank: int, gid: str) -> dict[str, object]:
         import socket
 
         import torch
@@ -35,7 +37,9 @@ class NcclRank:
                 "NCCL_NET": "IB",
                 "NCCL_IB_DISABLE": "0",
                 "NCCL_IB_HCA": HCA,
-                "NCCL_IB_GID_INDEX": GID,
+                "NCCL_IB_GID_INDEX": gid,
+                "NCCL_IB_ADDR_FAMILY": "AF_INET",
+                "NCCL_IB_ROCE_VERSION_NUM": "2",
                 "NCCL_SOCKET_IFNAME": IFACE,
                 "GLOO_SOCKET_IFNAME": IFACE,
                 "NCCL_CUMEM_ENABLE": "0",
@@ -76,7 +80,11 @@ def main() -> None:
         for ip in (HEAD_IP, WORKER_IP)
     ]
     try:
-        results = ray.get([actor.run.remote(rank) for rank, actor in enumerate(actors)], timeout=120)
+        gids = (HEAD_GID, WORKER_GID)
+        results = ray.get(
+            [actor.run.remote(rank, gids[rank]) for rank, actor in enumerate(actors)],
+            timeout=120,
+        )
     finally:
         for actor in actors:
             ray.kill(actor)

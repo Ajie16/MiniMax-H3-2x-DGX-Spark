@@ -25,6 +25,11 @@ preserves the rest of vLLM-Omni's device and model-parallel initialization.
 NCCL is explicitly configured for the selected RoCEv2 HCA, GID, and network
 interface.
 
+The H3 API and Ray dashboard bind to the configured head fabric address rather
+than every host interface. Ray control, rendezvous, and dynamic worker traffic
+still use host networking and must remain on a mutually trusted, firewalled
+fabric.
+
 MiniMax H3's DiT uses Ulysses sequence parallel size 2. Both actors execute
 every denoising request. Only rank 0 retains the result; tensors are moved to
 CPU before Ray serializes the response. Rank 0 also owns the encoders, VAE, and
@@ -48,3 +53,6 @@ The accepted scope is one synchronous, batch-size-one MiniMax H3 FL2VA request
 on two one-GPU DGX Sparks using the exact pinned base stack. Concurrent serving,
 other diffusion models, other GPU counts, other interconnects, and updated
 vLLM-Omni internals require new validation.
+
+See [REPRODUCIBILITY.md](REPRODUCIBILITY.md) for the accepted upstream digest,
+companion commit, local base image ID, and exact measured runtime versions.

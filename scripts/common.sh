@@ -44,3 +44,8 @@ h3_require_port() {
     h3_fail "$name must be an integer from 1 to 65535"
   fi
 }
+
+h3_require_nonnegative_integer() {
+  local name="$1" value="$2"
+  [[ "$value" =~ ^[0-9]+$ ]] || h3_fail "$name must be a non-negative integer"
+}

@@ -44,6 +44,9 @@ class RayDiffusionExecutor(DiffusionExecutor):
 
         head_ip = _required_env("H3_HEAD_IP")
         worker_ip = _required_env("H3_WORKER_IP")
+        shared_gid = os.environ.get("NCCL_IB_GID_INDEX", "3")
+        head_gid = _required_env("H3_HEAD_GID_INDEX", shared_gid)
+        worker_gid = _required_env("H3_WORKER_GID_INDEX", shared_gid)
         master_port = int(_required_env("H3_MASTER_PORT", "29500"))
         ray_address = _required_env("H3_RAY_ADDRESS", f"{head_ip}:6379")
         startup_timeout = float(os.environ.get("H3_WORKER_START_TIMEOUT", "2400"))
@@ -98,13 +101,15 @@ class RayDiffusionExecutor(DiffusionExecutor):
         remote_worker = ray.remote(num_gpus=1, max_restarts=0, max_task_retries=0)(RayDiffusionWorker)
         actor_handles = []
         for rank, node_ip in enumerate((head_ip, worker_ip)):
+            node_actor_env = dict(actor_env)
+            node_actor_env["NCCL_IB_GID_INDEX"] = head_gid if rank == 0 else worker_gid
             actor = remote_worker.options(
                 name=f"minimax-h3-diffusion-rank-{rank}-{os.getpid()}",
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     node_id=live_nodes[node_ip],
                     soft=False,
                 ),
-                runtime_env={"env_vars": actor_env},
+                runtime_env={"env_vars": node_actor_env},
             ).remote(
                 rank=rank,
                 world_size=world_size,
