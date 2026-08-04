@@ -10,7 +10,7 @@ report_failure() {
   fail=1
 }
 
-for required in README.md LICENSE NOTICE MODEL-LICENSE.md SECURITY.md CONTRIBUTING.md; do
+for required in README.md LICENSE NOTICE MODEL-LICENSE.md SECURITY.md CONTRIBUTING.md docs/REPRODUCIBILITY.md; do
   [[ -f "$required" ]] || report_failure "missing $required"
 done
 
@@ -26,9 +26,13 @@ if git ls-files --error-unmatch .env >/dev/null 2>&1; then
   report_failure '.env is tracked'
 fi
 
-if git ls-files | grep -E '\.(mp4|mov|mkv|avi|jpg|jpeg|png|webp|safetensors|bin|pt|pth|ckpt)$' >/dev/null; then
-  git ls-files | grep -E '\.(mp4|mov|mkv|avi|jpg|jpeg|png|webp|safetensors|bin|pt|pth|ckpt)$' >&2
-  report_failure 'generated media or model-like binary is tracked'
+candidate_files() {
+  git ls-files --cached --others --exclude-standard
+}
+
+if candidate_files | grep -E '\.(mp4|mov|mkv|avi|jpg|jpeg|png|webp|safetensors|bin|pt|pth|ckpt)$' >/dev/null; then
+  candidate_files | grep -E '\.(mp4|mov|mkv|avi|jpg|jpeg|png|webp|safetensors|bin|pt|pth|ckpt)$' >&2
+  report_failure 'generated media or model-like binary is a public candidate'
 fi
 
 while IFS= read -r file; do
@@ -38,19 +42,24 @@ while IFS= read -r file; do
     printf '%s (%s bytes)\n' "$file" "$size" >&2
     report_failure 'tracked file larger than 5 MiB'
   fi
-done < <(git ls-files)
+done < <(candidate_files)
 
 credential_pattern='(-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,})'
-if git grep -nI -E "$credential_pattern" -- ':!scripts/public-audit.sh'; then
+if xargs -r grep -nI -E "$credential_pattern" < <(candidate_files | grep -v '^scripts/public-audit\.sh$'); then
   report_failure 'credential-shaped text found'
 fi
 
-if git grep -nI 'joeyr1982' -- ':!scripts/public-audit.sh'; then
+if xargs -r grep -nI 'joeyr1982' < <(candidate_files | grep -v '^scripts/public-audit\.sh$'); then
   report_failure 'stale GitHub owner found'
 fi
 
-private_ip_pattern='(10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3})'
-if git grep -nI -E "$private_ip_pattern" -- ':!scripts/public-audit.sh'; then
+internal_identity_pattern='(^|[^A-Za-z0-9_-])([a-z]+dgx|spark-db[0-9]+|gx[0-9]+(-[0-9]+)?)([^A-Za-z0-9_-]|$)'
+if xargs -r grep -niI -E "$internal_identity_pattern" < <(candidate_files | grep -v '^scripts/public-audit\.sh$'); then
+  report_failure 'internal lab host identity found'
+fi
+
+private_ip_pattern='(10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3})'
+if xargs -r grep -nI -E "$private_ip_pattern" < <(candidate_files | grep -v '^scripts/public-audit\.sh$'); then
   report_failure 'private IPv4 address found'
 fi
 

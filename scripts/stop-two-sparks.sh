@@ -6,8 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 h3_load_env
 
-HEAD_HOST="${HEAD_HOST:-joeydgx}"
-WORKER_HOST="${WORKER_HOST:-gx10}"
+HEAD_HOST="${HEAD_HOST:-spark-head}"
+WORKER_HOST="${WORKER_HOST:-spark-peer}"
 
 h3_require_command ssh
 h3_require_safe_value HEAD_HOST "$HEAD_HOST"
