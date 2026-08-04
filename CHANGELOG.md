@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Repeated the complete live public-release acceptance on both Sparks using the
+  branch-built image ID
+  `sha256:09e6521356bbbb635048228d30e78a36c65352a48f7620c921d5aeff2d21b90b`.
+  The default full-compute profile became ready in 588.98 seconds and completed
+  compile-warm-up and warm T2VA requests in 70.337 and 46.574 seconds. The
+  balanced Cache-DiT profile became ready in 584.91 seconds and completed the
+  same requests in 55.412 and 30.578 seconds. All four outputs passed complete
+  FFmpeg decoding as H.264/AAC MP4 files; these release measurements do not
+  replace the previously published matched 50-step benchmark results.
 - Bound the unauthenticated H3 API and Ray dashboard to the configured private
   head fabric address instead of every host interface.
 - Replaced internal lab host identities in public examples with generic

@@ -3,6 +3,41 @@
 Verified August 3, 2026 on a two-DGX-Spark lab pair, with the head as rank 0
 and the peer as rank 1 over their private fabric addresses.
 
+## Public-release acceptance on August 4, 2026
+
+The release candidate was rebuilt from the public branch and produced image ID
+`sha256:09e6521356bbbb635048228d30e78a36c65352a48f7620c921d5aeff2d21b90b`
+on both ARM64 nodes. The provenance gate confirmed the pinned upstream digest,
+companion commit, accepted local base-image ID, and the runtime versions listed
+in `REPRODUCIBILITY.md`.
+
+Both the default full-compute launcher and the optional balanced Cache-DiT
+launcher completed a fresh cold start and two fixed-input smoke requests. The
+first request after each start includes lazy regional compilation; the second
+is the warm measurement.
+
+| Profile | Ready time | Compile warm-up | Warm request |
+|---|---:|---:|---:|
+| cuDNN + regional compile, full compute | 588.98 s | 70.337 s | 46.574 s |
+| cuDNN + regional compile, balanced Cache-DiT | 584.91 s | 55.412 s | 30.578 s |
+
+All four results were 56-frame, 768x448, 24 fps H.264 video with 32 kHz stereo
+AAC and passed a complete FFmpeg decode. Midpoint inspection matched the PCB
+soldering prompt, and audio was non-silent. During denoising, the two GPUs were
+simultaneously measured at 96%/95% utilization for full compute and 96%/94%
+for Cache-DiT.
+
+For both profiles, Ray reported two active nodes and two allocated GPUs with no
+failures. `/health` returned HTTP 200, `/v1/models` matched the configured
+checkpoint exactly, and all three containers remained running with zero
+restarts and `OOMKilled=false`. The API and Ray dashboard listened only on the
+configured private head address; neither accepted a loopback connection. The
+balanced profile remained live after acceptance.
+
+This release check intentionally did not repeat the expensive 50-step quality
+workload. The matched benchmark values below remain the published quality and
+performance claims.
+
 ## Runtime proof
 
 - Ray reported two active nodes and two allocated GPUs with no pending demands
