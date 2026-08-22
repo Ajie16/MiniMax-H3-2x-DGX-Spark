@@ -33,6 +33,38 @@ The DiT uses two-way Ulysses sequence parallelism. Both GPUs contribute to the
 same denoising trajectory; rank 0 also owns the encoders, VAE, and final API
 response.
 
+### Ref2VA multi-reference inputs (2026-08-22)
+
+The derived image overwrites the upstream H3 pipeline
+(`patches/minimax_h3_pipeline.py`) and patches the OpenAI video API
+(`patches/allow-mixed-ref-inputs.patch`) so the Ref2VA partition accepts the
+full Comfy-style reference set: up to **9 images**, **3 videos**, and **3
+standalone audios**, in any combination (`task=ref2va` only; fl2va/t2va keep
+the upstream single-reference rules).
+
+- Multipart `input_references` uploads are sniffed by content type/filename
+  (`h3_multinode.ref_inputs`): images cross Ray as PIL objects, videos are
+  persisted on the API node (only rank 0 reads them), audios are decoded in
+  the API process to `(waveform, sample_rate)` tuples so no shared host path
+  is needed.
+- `audio_reference` (`file://` JSON, via `patches/allow-file-audio-url.patch`)
+  still works and is merged with any uploaded audios; a `file://` path must
+  exist at the same absolute path on both nodes.
+- Requests over the caps are rejected with HTTP 400 before any GPU work.
+- Condition-label ordering matches Comfy: images first, then each video
+  (soundtrack label before its video label), then standalone audios.
+- Reference-image alignment follows ComfyUI's `ref_image_size` (pass via
+  `extra_params`): `match` (default) scales references to the generation
+  canvas for speed; `max` keeps up to a 2048px short edge for stronger
+  identity fidelity at much higher token cost.
+
+  `match` is a **non-uniform** resize to the output canvas: provide reference
+  images with the same aspect ratio as `width`/`height`, otherwise the subject
+  is stretched/squashed. A 1:1 reference pairs with a square canvas (for
+  example 768x768, or up to 992x992, 32-aligned and still within the model's
+  native ~1.03MP canvas cap) without any aspect distortion; `max` preserves
+  the reference aspect ratio regardless of the canvas.
+
 ## Verified results
 
 The final public-release acceptance ran on August 4, 2026 using the same

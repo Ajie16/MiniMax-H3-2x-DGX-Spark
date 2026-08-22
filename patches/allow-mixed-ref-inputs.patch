@@ -1,0 +1,167 @@
+--- a/vllm_omni/entrypoints/openai/api_server.py
++++ b/vllm_omni/entrypoints/openai/api_server.py
+@@ -2855,8 +2855,10 @@
+         for path in reference_video.cleanup_paths:
+             if os.path.exists(path):
+                 os.unlink(path)
+-    if reference_audio is not None and os.path.exists(reference_audio.path):
+-        os.unlink(reference_audio.path)
++    if reference_audio is not None:
++        for path in reference_audio.cleanup_paths:
++            if os.path.exists(path):
++                os.unlink(path)
+ 
+ 
+ async def _run_video_generation_job(
+@@ -2946,13 +2948,18 @@
+ 
+ 
+ async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[str]:
++    # Two-Spark Ref2VA: the Ray rank-0 actor lives in a different container
++    # mount namespace than this API process. When H3_REF_UPLOAD_DIR is set it
++    # must point at a directory bind-mounted at the same absolute path into
++    # every node container, so the worker can open the persisted upload.
++    upload_dir = os.environ.get("H3_REF_UPLOAD_DIR") or None
+     paths: list[str] = []
+     try:
+         for upload in uploads:
+             suffix = Path(upload.filename or "").suffix.lower()
+             if suffix not in {".mkv", ".mov", ".mp4", ".webm"}:
+                 suffix = ".mp4"
+-            fd, path = tempfile.mkstemp(prefix="vllm_omni_video_reference_", suffix=suffix)
++            fd, path = tempfile.mkstemp(prefix="vllm_omni_video_reference_", suffix=suffix, dir=upload_dir)
+             paths.append(path)
+             with os.fdopen(fd, "wb") as output:
+                 while chunk := await upload.read(1024 * 1024):
+@@ -3103,9 +3110,49 @@
+         decode_spec = _reference_video_decode_spec(request, stage_configs)
+     reference_image = None
+     reference_video = None
++    ref_audio_uploads: list[Any] = []
+     if input_references:
+-        paths = await _persist_uploaded_video_references(input_references)
+-        reference_video = ReferenceVideo(data=paths, cleanup_paths=tuple(paths))
++        # Two-Spark Ref2VA: sniff mixed uploads (Comfy parity) instead of
++        # treating every input_references file as a video. Images cross Ray as
++        # PIL objects; videos are persisted on the API node (only rank 0 reads
++        # them); audios are decoded here so the (waveform, sample_rate) tuple
++        # crosses Ray and no shared host path is needed.
++        from h3_multinode.ref_inputs import (
++            is_audio_upload,
++            is_image_upload,
++            is_video_upload,
++            validate_ref_counts,
++        )
++
++        ref_images: list[Image.Image] = []
++        ref_video_uploads: list[UploadFile] = []
++        for upload in input_references:
++            if is_image_upload(upload.filename, upload.content_type):
++                ref_images.append(Image.open(io.BytesIO(await upload.read())).convert("RGB"))
++            elif is_audio_upload(upload.filename, upload.content_type):
++                import torchaudio
++
++                ref_audio_uploads.append(torchaudio.load(io.BytesIO(await upload.read())))
++            elif is_video_upload(upload.filename, upload.content_type):
++                ref_video_uploads.append(upload)
++            else:
++                raise HTTPException(
++                    status_code=HTTPStatus.BAD_REQUEST.value,
++                    detail=f"Unsupported input_references file type: {upload.filename!r}",
++                )
++        try:
++            validate_ref_counts(
++                len(ref_images),
++                len(ref_video_uploads),
++                len(ref_audio_uploads) + (1 if request.audio_reference is not None else 0),
++            )
++        except ValueError as exc:
++            raise HTTPException(400, detail=str(exc)) from exc
++        if ref_images:
++            reference_image = ReferenceImage(data=ref_images)
++        if ref_video_uploads:
++            paths = await _persist_uploaded_video_references(ref_video_uploads)
++            reference_video = ReferenceVideo(data=paths, cleanup_paths=tuple(paths))
+     else:
+         try:
+             media_data = await decode_input_reference(
+@@ -3122,13 +3169,21 @@
+         reference_video = ReferenceVideo(data=media_data) if isinstance(media_data, list) else None
+ 
+     reference_audio: ReferenceAudio | None = None
++    audio_items: list[Any] = list(ref_audio_uploads)
++    audio_cleanup: list[str] = []
+     if request.audio_reference is not None:
+         try:
+             audio_path = await decode_audio_url(request.audio_reference.audio_url)
+         except InvalidInputReferenceError as exc:
+             _cleanup_video_references(reference_video, None)
+             raise HTTPException(400, detail=str(exc)) from exc
+-        reference_audio = ReferenceAudio(path=audio_path)
++        audio_items.append(audio_path)
++        # file:// paths are user-owned shared files; only data-URL temp files
++        # may be unlinked after the request.
++        if not request.audio_reference.audio_url.startswith("file://"):
++            audio_cleanup.append(audio_path)
++    if audio_items:
++        reference_audio = ReferenceAudio(path=audio_items, cleanup_paths=tuple(audio_cleanup))
+ 
+     return request, handler, effective_model_name, reference_image, reference_video, reference_audio
+ 
+--- a/vllm_omni/entrypoints/openai/serving_video.py
++++ b/vllm_omni/entrypoints/openai/serving_video.py
+@@ -43,7 +43,7 @@
+ class ReferenceImage:
+     """Reference class for tracking additional metadata if needed"""
+ 
+-    data: Image.Image
++    data: Image.Image | list[Image.Image]
+ 
+ 
+ @dataclass
+@@ -58,7 +58,9 @@
+ class ReferenceAudio:
+     """Reference audio file path for speech-to-video generation."""
+ 
+-    path: str
++    path: str | list[Any]
++    # Only data-URL temp files land here; file:// paths are user-owned.
++    cleanup_paths: tuple[str, ...] = ()
+ 
+ 
+ @dataclass
+@@ -130,7 +132,10 @@
+ 
+         input_image = None if reference_image is None else reference_image.data
+         input_video = None if reference_video is None else reference_video.data
+-        if input_image is not None and input_video is not None:
++        # Two-Spark Ref2VA: mixed reference kinds (images + videos + audios) are
++        # valid only for the ref2va task; other tasks keep the upstream rules.
++        ref2va_task = str((request.extra_params or {}).get("task", "")).lower() == "ref2va"
++        if input_image is not None and input_video is not None and not ref2va_task:
+             raise HTTPException(
+                 status_code=HTTPStatus.BAD_REQUEST.value,
+                 detail="Provide either an image reference or a video reference, not both.",
+@@ -138,14 +143,20 @@
+         provided_fields = request.model_fields_set
+         fps_provided = self._request_fps_provided(request)
+         vp = request.resolve_video_params()
+-        if input_image is not None and vp.width is not None and vp.height is not None:
++        if (
++            input_image is not None
++            and not isinstance(input_image, list)
++            and not ref2va_task
++            and vp.width is not None
++            and vp.height is not None
++        ):
+             target_size = (vp.width, vp.height)
+             if input_image.size != target_size:
+                 input_image = input_image.resize(target_size, Image.Resampling.LANCZOS)
+         multi_modal_data: dict[str, Any] = {}
+         if input_image is not None:
+             multi_modal_data["image"] = input_image
+-        elif input_video is not None:
++        if input_video is not None:
+             multi_modal_data["video"] = input_video
+         if reference_audio is not None:
+             multi_modal_data["audio"] = reference_audio.path

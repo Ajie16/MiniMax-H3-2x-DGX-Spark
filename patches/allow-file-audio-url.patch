@@ -1,0 +1,21 @@
+--- a/vllm_omni/entrypoints/openai/video_api_utils.py
++++ b/vllm_omni/entrypoints/openai/video_api_utils.py
+@@ -221,6 +221,18 @@
+     """Decode an audio URL or data-URL to a temporary file path."""
+     import tempfile
+ 
++    # Two-Spark Ref2VA: both ranks must open the same host path. Data-URL
++    # temp files live only on the API node and fail on rank 1.
++    if audio_url.startswith("file://"):
++        from pathlib import Path
++
++        path = Path(audio_url[len("file://") :])
++        if not path.is_file():
++            raise InvalidInputReferenceError(
++                f"Invalid audio_reference.audio_url: file not found: {path}"
++            )
++        return str(path)
++
+     audio_bytes: bytes | None = None
+ 
+     if audio_url.startswith("data:audio"):
