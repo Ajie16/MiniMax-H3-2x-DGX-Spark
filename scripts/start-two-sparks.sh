@@ -78,6 +78,15 @@ fi
 if [[ "$CACHE_BACKEND" = none && ( -n "$CACHE_CONFIG" || "$ENABLE_CACHE_DIT_SUMMARY" = true ) ]]; then
   h3_fail "cache configuration requires H3_CACHE_BACKEND=cache_dit"
 fi
+h3_validate_lora_profile
+LORA_MODE="${H3_LORA_MODE:-off}"
+lora_vol=""
+if [[ "$LORA_MODE" != off ]]; then
+  lora_vol="-v '$H3_LORA_DIR':'$H3_LORA_DIR':ro"
+  REF_MEDIA_DIR="${H3_REF_MEDIA_DIR:-$(dirname "$H3_LORA_DIR")/ref-media}"
+  h3_require_safe_value H3_REF_MEDIA_DIR "$REF_MEDIA_DIR"
+  lora_vol+=" -v '$REF_MEDIA_DIR':'$REF_MEDIA_DIR'"
+fi
 h3_require_ipv4 HEAD_IP "$HEAD_IP"
 h3_require_ipv4 WORKER_IP "$WORKER_IP"
 h3_require_port H3_API_PORT "$API_PORT"
@@ -102,7 +111,18 @@ COMMON_ENV=(
   -e VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   -e RAY_memory_monitor_refresh_ms=0
+  -e RAY_health_check_failure_threshold=30
+  -e RAY_health_check_period_ms=5000
+  -e RAY_health_check_timeout_ms=30000
 )
+if [[ "$LORA_MODE" != off ]]; then
+  COMMON_ENV+=(
+    -e "H3_LORA_MODE=$LORA_MODE"
+    -e "H3_LORA_DIR=$H3_LORA_DIR"
+    -e "H3_LORA_NAME=${H3_LORA_NAME:-}"
+    -e "H3_LORA_ALLOW_TURBO=${H3_LORA_ALLOW_TURBO:-false}"
+  )
+fi
 
 docker_args_text() {
   printf ' %q' "$@"
@@ -135,10 +155,30 @@ cache_args_text=""
 if (( ${#cache_args[@]} )); then
   cache_args_text="$(docker_args_text "${cache_args[@]}")"
 fi
+lora_env_text=""
+if [[ "$LORA_MODE" != off ]]; then
+  lora_env=()
+  for var in H3_LORA_MODE H3_LORA_DIR H3_LORA_CATALOG H3_LORA_NAME H3_LORA_SCALE H3_MAX_CPU_LORAS H3_LORA_ALLOW_TURBO; do
+    if [[ -v $var ]]; then
+      lora_env+=(-e "$var=${!var}")
+    fi
+  done
+  # Ref2VA: the API container persists uploaded reference videos here so the
+  # rank-0 actor (different mount namespace) can read them at the same path.
+  lora_env+=(-e "H3_REF_UPLOAD_DIR=$REF_MEDIA_DIR")
+  if (( ${#lora_env[@]} )); then
+    lora_env_text="$(docker_args_text "${lora_env[@]}")"
+  fi
+fi
+
+if [[ "$LORA_MODE" != off ]]; then
+  ssh "$HEAD_HOST" "mkdir -p $(printf '%q' "$REF_MEDIA_DIR")"
+  ssh "$WORKER_HOST" "mkdir -p $(printf '%q' "$REF_MEDIA_DIR")"
+fi
 
 # Validated values are intentionally expanded on the client for remote Docker.
 # shellcheck disable=SC2029
-ssh "$HEAD_HOST" "docker run -d --name minimax-h3-2x-ray-head --network host --ipc host --gpus all --device /dev/infiniband --cap-add IPC_LOCK $head_common -v minimax-h3-2x-ray-tmp:/tmp/ray -v '$MODEL_DIR':'$MODEL_DIR':ro -v '$HF_CACHE':/root/.cache/huggingface --entrypoint ray '$IMAGE' start --head --node-ip-address='$HEAD_IP' --port='$RAY_PORT' --dashboard-host='$HEAD_IP' --dashboard-port=8265 --num-cpus=8 --num-gpus=1 --object-store-memory=2000000000 --disable-usage-stats --block >/dev/null"
+ssh "$HEAD_HOST" "docker run -d --name minimax-h3-2x-ray-head --network host --ipc host --gpus all --device /dev/infiniband --cap-add IPC_LOCK $head_common -v minimax-h3-2x-ray-tmp:/tmp/ray -v '$MODEL_DIR':'$MODEL_DIR':ro -v '$HF_CACHE':/root/.cache/huggingface $lora_vol --entrypoint ray '$IMAGE' start --head --node-ip-address='$HEAD_IP' --port='$RAY_PORT' --dashboard-host='$HEAD_IP' --dashboard-port=8265 --num-cpus=8 --num-gpus=1 --object-store-memory=2000000000 --disable-usage-stats --block >/dev/null"
 
 for _ in $(seq 1 30); do
   if ssh "$HEAD_HOST" "docker exec minimax-h3-2x-ray-head ray status" >/dev/null 2>&1; then
@@ -153,7 +193,7 @@ test "${ray_head_ready:-0}" = 1 || {
 }
 
 # shellcheck disable=SC2029
-ssh "$WORKER_HOST" "docker run -d --name minimax-h3-2x-ray-worker --network host --ipc host --gpus all --device /dev/infiniband --cap-add IPC_LOCK $worker_common -v minimax-h3-2x-ray-worker-tmp:/tmp/ray -v '$MODEL_DIR':'$MODEL_DIR':ro -v '$HF_CACHE':/root/.cache/huggingface --entrypoint ray '$IMAGE' start --address='$HEAD_IP:$RAY_PORT' --node-ip-address='$WORKER_IP' --num-cpus=8 --num-gpus=1 --object-store-memory=2000000000 --disable-usage-stats --block >/dev/null"
+ssh "$WORKER_HOST" "docker run -d --name minimax-h3-2x-ray-worker --network host --ipc host --gpus all --device /dev/infiniband --cap-add IPC_LOCK $worker_common -v minimax-h3-2x-ray-worker-tmp:/tmp/ray -v '$MODEL_DIR':'$MODEL_DIR':ro -v '$HF_CACHE':/root/.cache/huggingface $lora_vol --entrypoint ray '$IMAGE' start --address='$HEAD_IP:$RAY_PORT' --node-ip-address='$WORKER_IP' --num-cpus=8 --num-gpus=1 --object-store-memory=2000000000 --disable-usage-stats --block >/dev/null"
 
 for _ in $(seq 1 60); do
   nodes="$(ssh "$HEAD_HOST" "docker exec minimax-h3-2x-ray-head ray status 2>/dev/null" || true)"
@@ -169,6 +209,6 @@ test "${ray_pair_ready:-0}" = 1 || {
 }
 
 # shellcheck disable=SC2029
-ssh "$HEAD_HOST" "docker run -d --name minimax-h3-2x-api --network host --ipc host --pid=container:minimax-h3-2x-ray-head --gpus all --device /dev/infiniband --cap-add IPC_LOCK $head_common -e H3_HEAD_IP='$HEAD_IP' -e H3_WORKER_IP='$WORKER_IP' -e H3_HEAD_GID_INDEX='$HEAD_GID' -e H3_WORKER_GID_INDEX='$WORKER_GID' -e H3_RAY_ADDRESS='$HEAD_IP:$RAY_PORT' -e H3_MASTER_PORT='$MASTER_PORT' -e H3_WORKER_START_TIMEOUT=2400 -e H3_API_PORT='$API_PORT' -v minimax-h3-2x-ray-tmp:/tmp/ray -v '$MODEL_DIR':'$MODEL_DIR':ro -v '$HF_CACHE':/root/.cache/huggingface -v '$OUTPUT_DIR':/output --entrypoint vllm '$IMAGE' serve '$MODEL_DIR' --omni --trust-remote-code --host '$HEAD_IP' --port '$API_PORT' --num-gpus 2 --usp 2 --ring 1 --vae-patch-parallel-size 2 --vae-parallel-mode tile --vae-use-tiling --num-weight-load-threads 2 $execution_args_text $cache_args_text --diffusion-attention-backend '$ATTENTION_BACKEND' --diffusion-quantization-config '{\"method\":\"fp8\",\"activation_scheme\":\"dynamic\",\"ignored_layers\":[\"video_patch_proj\",\"audio_patch_proj\",\"time_embedder.proj_in\",\"time_embedder.proj_out\",\"final_layer.video_out\",\"final_layer.audio_out\"]}' --force-cutlass-fp8 --distributed-executor-backend ray --stage-init-timeout 1800 --init-timeout 2400 >/dev/null"
+ssh "$HEAD_HOST" "docker run -d --name minimax-h3-2x-api --network host --ipc host --pid=container:minimax-h3-2x-ray-head --gpus all --device /dev/infiniband --cap-add IPC_LOCK $head_common $lora_env_text -e H3_HEAD_IP='$HEAD_IP' -e H3_WORKER_IP='$WORKER_IP' -e H3_HEAD_GID_INDEX='$HEAD_GID' -e H3_WORKER_GID_INDEX='$WORKER_GID' -e H3_RAY_ADDRESS='$HEAD_IP:$RAY_PORT' -e H3_MASTER_PORT='$MASTER_PORT' -e H3_WORKER_START_TIMEOUT=2400 -e H3_API_PORT='$API_PORT' -v minimax-h3-2x-ray-tmp:/tmp/ray -v '$MODEL_DIR':'$MODEL_DIR':ro -v '$HF_CACHE':/root/.cache/huggingface -v '$OUTPUT_DIR':/output $lora_vol --entrypoint vllm '$IMAGE' serve '$MODEL_DIR' --omni --trust-remote-code --host '$HEAD_IP' --port '$API_PORT' --num-gpus 2 --usp 2 --ring 1 --vae-patch-parallel-size 2 --vae-parallel-mode tile --vae-use-tiling --num-weight-load-threads 2 $execution_args_text $cache_args_text --diffusion-attention-backend '$ATTENTION_BACKEND' --diffusion-quantization-config '{\"method\":\"fp8\",\"activation_scheme\":\"dynamic\",\"ignored_layers\":[\"video_patch_proj\",\"audio_patch_proj\",\"time_embedder.proj_in\",\"time_embedder.proj_out\",\"final_layer.video_out\",\"final_layer.audio_out\"]}' --force-cutlass-fp8 --distributed-executor-backend ray --stage-init-timeout 1800 --init-timeout 2400 >/dev/null"
 
 echo "two-Spark H3 launch started: attention=$ATTENTION_BACKEND execution=$EXECUTION_MODE cache=$CACHE_BACKEND; API will appear at http://$HEAD_IP:$API_PORT/v1 after both ranks load"

@@ -33,6 +33,48 @@ The DiT uses two-way Ulysses sequence parallelism. Both GPUs contribute to the
 same denoising trajectory; rank 0 also owns the encoders, VAE, and final API
 response.
 
+## Local deployment (2026-08-19, this fork)
+
+This fork is deployed live on the two-Spark cluster at the workspace root
+`/home/xujie/workspace/dgx-spark-minimax-h3`. The roles are **flipped** so the
+local work machine (`spark-0d97`) runs only the light rank 1 while the API
+host is the second Spark:
+
+| Role | Host | Fabric address | Distributed rank | Memory after load |
+|---|---|---:|---:|---:|
+| API / rank 0 (encoders, VAE, output) | `xujie2` / `spark-ac8f` | 10.100.65.1 | 0 | ~97 GiB used |
+| rank 1 (DiT half) | local / `spark-0d97` | 10.100.65.2 | 1 | ~48 GiB used |
+
+- API base: `http://10.100.65.1:8000/v1`; Ray dashboard:
+  `http://10.100.65.1:8265` (private fabric only, no auth by design).
+- Fabric: `enP2p1s0f0np0`, HCA `roceP2p1s0f0`, RoCEv2 GID index 3 on both
+  nodes; NCCL verified at ~21 GB/s all_gather.
+- Images: base `minimax-h3-dgx-spark:sm121-fp8` is locally re-derived from
+  companion commit `8bd7628` as `sha256:e498adce…` (the upstream acceptance
+  ID is not reproducible across machines because Docker image IDs embed build
+  metadata; upstream digest, layer ancestry, and runtime versions are still
+  verified fail-closed). The service image
+  `minimax-h3-2x-dgx-spark:experimental` is `sha256:81001bb2…` and identical
+  on both nodes.
+- Build on this cluster needs host networking and a reachable PyPI mirror:
+
+  ```bash
+  H3_BUILD_NETWORK=host \
+  H3_BUILD_PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+  H3_BUILD_PIP_TRUSTED_HOST=mirrors.aliyun.com \
+  SYNC_WORKER=1 ./scripts/build-image.sh
+  ```
+
+- Measured acceptance (fixed 768x448 T2VA, 20 steps): first request
+  70.652 s / 73.551 s (lazy regional compile), warm request 47.914 s; outputs
+  are byte-stable across role flips (SHA-256 `212a43c8…`).
+- The model is byte-identical on both nodes (81/81 files SHA-256 match,
+  ~135 GiB). `ffmpeg`/`ffprobe` are installed on the local host for
+  `make smoke` / `make verify`.
+- Operational instructions are packaged as the Codex skill
+  `dgx-spark-2x-h3-api` (startup, usage, rebuild, troubleshooting), see
+  `~/.codex/skills/dgx-spark-2x-h3-api`.
+
 ### Ref2VA multi-reference inputs (2026-08-22)
 
 The derived image overwrites the upstream H3 pipeline
@@ -139,7 +181,7 @@ example uses non-routable documentation addresses that must be replaced.
 ## Quick start
 
 ```bash
-git clone https://github.com/joeynyc/MiniMax-H3-2x-DGX-Spark.git
+git clone git@github.com:Ajie16/MiniMax-H3-2x-DGX-Spark.git
 cd MiniMax-H3-2x-DGX-Spark
 cp .env.example .env
 # Edit .env: both hosts, fabric, shared paths, and license acknowledgement.

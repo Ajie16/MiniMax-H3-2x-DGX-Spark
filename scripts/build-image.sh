@@ -8,7 +8,12 @@ h3_load_env
 
 IMAGE="${H3_2X_IMAGE:-minimax-h3-2x-dgx-spark:experimental}"
 BASE_IMAGE="${H3_BASE_IMAGE:-minimax-h3-dgx-spark:sm121-fp8}"
-EXPECTED_BASE_IMAGE_ID="sha256:2383642e221530d3dc26a8f8632c37e00470b051979f0845c2ec0ff9513e04b2"
+# The upstream acceptance recorded the author's own build ID, which is not
+# reproducible across machines because Docker image IDs embed build metadata.
+# This fork re-derives the base image from companion commit 8bd7628 and pins
+# the locally measured ID below. The upstream digest, companion commit, layer
+# ancestry, and runtime version set are still verified fail-closed.
+EXPECTED_BASE_IMAGE_ID="sha256:e498adce4d08a27d88f7c2a23a50563d508815cb78f12442a765326e661e2146"
 UPSTREAM_BASE_IMAGE="vllm/vllm-omni:minimax-h3@sha256:e930db8e225162d01e17a49dddc43fd0e844208908d8356a028e5c4e7357696e"
 COMPANION_REPO_COMMIT="8bd7628dbdb51a0ea00c301ddcb1a098874870e4"
 WORKER_HOST="${WORKER_HOST:-spark-peer}"
@@ -46,7 +51,25 @@ for index in "${!upstream_layers[@]}"; do
     h3_fail "local base image does not descend from the accepted upstream digest"
 done
 
-docker build \
+BUILD_EXTRA_ARGS=()
+if [[ -n "${H3_BUILD_NETWORK:-}" || -n "${H3_BUILD_PROXY:-}" ]]; then
+  # Local deployments behind an HTTP proxy (or with direct egress) need host
+  # networking so the build container can reach the host proxy on 127.0.0.1
+  # or the host's direct internet path during the pip install step.
+  BUILD_EXTRA_ARGS+=(--network host)
+fi
+if [[ -n "${H3_BUILD_PROXY:-}" ]]; then
+  BUILD_EXTRA_ARGS+=(--build-arg "HTTP_PROXY=$H3_BUILD_PROXY")
+  BUILD_EXTRA_ARGS+=(--build-arg "HTTPS_PROXY=$H3_BUILD_PROXY")
+  BUILD_EXTRA_ARGS+=(--build-arg "NO_PROXY=localhost,127.0.0.1")
+fi
+if [[ -n "${H3_BUILD_PIP_INDEX_URL:-}" ]]; then
+  BUILD_EXTRA_ARGS+=(--build-arg "PIP_INDEX_URL=$H3_BUILD_PIP_INDEX_URL")
+fi
+if [[ -n "${H3_BUILD_PIP_TRUSTED_HOST:-}" ]]; then
+  BUILD_EXTRA_ARGS+=(--build-arg "PIP_TRUSTED_HOST=$H3_BUILD_PIP_TRUSTED_HOST")
+fi
+docker build "${BUILD_EXTRA_ARGS[@]}" \
   --build-arg "BASE_IMAGE=$BASE_IMAGE" \
   --build-arg "H3_UPSTREAM_BASE_IMAGE=$UPSTREAM_BASE_IMAGE" \
   --build-arg "H3_COMPANION_REPO_COMMIT=$COMPANION_REPO_COMMIT" \
