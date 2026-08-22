@@ -11,9 +11,13 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 
+from .lora_catalog import LORA_ENV_KEYS, resolve_adapter, resolved_scale
+from .lora_mapping import install_h3_lora_packed_mapping
 from .worker import RayDiffusionWorker
 
 logger = init_logger(__name__)
+
+
 
 
 def _required_env(name: str, default: str | None = None) -> str:
@@ -41,6 +45,9 @@ class RayDiffusionExecutor(DiffusionExecutor):
         world_size = int(self.od_config.num_gpus)
         if world_size != 2:
             raise ValueError(f"This executor requires exactly two GPUs on two hosts; got {world_size}")
+
+        self._apply_lora_od_config()
+        install_h3_lora_packed_mapping()
 
         head_ip = _required_env("H3_HEAD_IP")
         worker_ip = _required_env("H3_WORKER_IP")
@@ -97,6 +104,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
                 "H3_MASTER_PORT": str(master_port),
             }
         )
+        actor_env.update({key: os.environ[key] for key in LORA_ENV_KEYS if key in os.environ})
 
         remote_worker = ray.remote(num_gpus=1, max_restarts=0, max_task_retries=0)(RayDiffusionWorker)
         actor_handles = []
@@ -133,6 +141,24 @@ class RayDiffusionExecutor(DiffusionExecutor):
             self.shutdown()
             raise RuntimeError(f"Invalid distributed worker readiness: {ready}")
         logger.info("MiniMax H3 two-node workers ready: %s", hosts)
+
+    def _apply_lora_od_config(self) -> None:
+        mode = os.environ.get("H3_LORA_MODE", "off")
+        if mode == "request" and not bool(getattr(self.od_config, "enforce_eager", False)):
+            raise RuntimeError("H3_LORA_MODE=request requires H3_EXECUTION_MODE=eager")
+        if mode == "off":
+            return
+        if mode == "static":
+            entry = resolve_adapter(os.environ["H3_LORA_NAME"])
+            self.od_config.lora_path = str(entry.resolved_path)
+            self.od_config.lora_scale = resolved_scale(catalog_default=entry.default_scale)
+            self.od_config.max_cpu_loras = int(os.environ.get("H3_MAX_CPU_LORAS", "1"))
+            return
+        if mode == "request":
+            self.od_config.lora_path = None
+            self.od_config.max_cpu_loras = int(os.environ.get("H3_MAX_CPU_LORAS", "1"))
+            return
+        raise RuntimeError(f"invalid H3_LORA_MODE={mode!r}")
 
     @property
     def is_dead(self) -> bool:

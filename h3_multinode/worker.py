@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import os
 import socket
+import time
 import traceback
 from typing import Any
 from unittest.mock import patch
 
 import torch
+
+from vllm.logger import init_logger
+
+from .lora_catalog import assert_lora_path_allowed, resolve_adapter, resolved_scale
+from .lora_mapping import install_h3_lora_packed_mapping
+
+logger = init_logger(__name__)
 
 
 def _move_tensors_to_cpu(value: Any) -> Any:
@@ -75,6 +83,16 @@ def _make_worker_class(master_addr: str, master_port: int):
             os.environ["RANK"] = str(self.rank)
             os.environ["WORLD_SIZE"] = str(self.od_config.num_gpus)
 
+        def init_lora_manager(self) -> None:
+            install_h3_lora_packed_mapping()
+            super().init_lora_manager()
+            manager = getattr(self, "lora_manager", None)
+            if manager is None or os.environ.get("H3_LORA_MODE", "off") != "static":
+                return
+            adapters = getattr(manager, "list_adapters", lambda: [])()
+            if adapters:
+                manager.pin_adapter(adapters[0])
+
     return MultiNodeDiffusionWorker
 
 
@@ -103,6 +121,7 @@ class RayDiffusionWorker:
             )
 
         load_omni_general_plugins()
+        install_h3_lora_packed_mapping()
         worker_class = _make_worker_class(master_addr, master_port)
         self.worker = worker_class(
             local_rank=0,
@@ -132,7 +151,12 @@ class RayDiffusionWorker:
         if not execute:
             return {"rank": self.rank, "ok": True, "result": None, "skipped": True}
         try:
+            if method == "execute_model":
+                self._prepare_lora_request(args[0] if args else None)
+            started = time.monotonic()
             result = getattr(self.worker, method)(*args, **kwargs)
+            if method == "execute_model":
+                self._log_lora_activation(args[0] if args else None, started)
             if output_rank is not None and self.rank != output_rank:
                 result = None
             else:
@@ -153,6 +177,50 @@ class RayDiffusionWorker:
                 "result": None,
                 "skipped": False,
             }
+
+    def _prepare_lora_request(self, req: Any) -> None:
+        sampling = getattr(req, "sampling_params", None)
+        if sampling is None:
+            return
+        mode = os.environ.get("H3_LORA_MODE", "off")
+        lora_request = getattr(sampling, "lora_request", None)
+        if mode == "off":
+            if lora_request is not None:
+                raise RuntimeError("LoRA is disabled (H3_LORA_MODE=off)")
+            return
+        if mode == "static" and lora_request is None:
+            entry = resolve_adapter(os.environ["H3_LORA_NAME"])
+            sampling.lora_request = entry.to_request()
+            sampling.lora_scale = resolved_scale(catalog_default=entry.default_scale)
+            lora_request = sampling.lora_request
+        if lora_request is None:
+            return
+        expected = None
+        if mode == "static":
+            expected = resolve_adapter(os.environ["H3_LORA_NAME"]).resolved_path
+        elif getattr(lora_request, "lora_name", None):
+            expected = resolve_adapter(lora_request.lora_name).resolved_path
+        assert_lora_path_allowed(str(lora_request.lora_path), expected=expected)
+
+    def _log_lora_activation(self, req: Any, started: float) -> None:
+        sampling = getattr(req, "sampling_params", None)
+        lora_request = getattr(sampling, "lora_request", None) if sampling is not None else None
+        mode = os.environ.get("H3_LORA_MODE", "off")
+        name = getattr(lora_request, "lora_name", None) if lora_request is not None else "-"
+        int_id = getattr(lora_request, "lora_int_id", None) if lora_request is not None else "-"
+        path = getattr(lora_request, "lora_path", None) if lora_request is not None else "-"
+        scale = getattr(sampling, "lora_scale", None) if sampling is not None else "-"
+        load_ms = int((time.monotonic() - started) * 1000)
+        logger.info(
+            "H3 LoRA rank=%s mode=%s name=%s int_id=%s scale=%s path=%s load_ms=%s compile_cache=n/a",
+            self.rank,
+            mode,
+            name,
+            int_id,
+            scale,
+            path,
+            load_ms,
+        )
 
     def ping(self) -> dict[str, Any]:
         if self._closed:

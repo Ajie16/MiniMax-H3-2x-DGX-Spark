@@ -1,0 +1,44 @@
+--- a/vllm_omni/entrypoints/openai/serving_video.py	2026-08-20 23:28:43.493116471 +0800
++++ b/vllm_omni/entrypoints/openai/serving_video.py	2026-08-20 23:28:43.514230054 +0800
+@@ -26,7 +26,8 @@
+     build_stage_sampling_params_list,
+     get_default_sampling_params_list,
+ )
+-from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
++from vllm_omni.entrypoints.openai.utils import get_stage_type, resolve_diffusion_od_config
++from h3_multinode.lora_catalog import apply_request_lora, enforce_turbo_schedule, resolve_adapter
+ from vllm_omni.entrypoints.openai.video_api_utils import _encode_video_bytes, encode_video_base64
+ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+ from vllm_omni.outputs.output_metadata import (
+@@ -378,10 +379,13 @@
+                     return copy.deepcopy(params)
+         return OmniDiffusionSamplingParams()
+ 
+-    @staticmethod
+-    def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
++    def _apply_lora(self, lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
+         try:
+-            lora_request, lora_scale = parse_lora_request(lora_body)
++            od_config = resolve_diffusion_od_config(self._engine_client)
++            enforce_eager = bool(getattr(od_config, "enforce_eager", False))
++            lora_request, lora_scale = apply_request_lora(
++                lora_body, enforce_eager=enforce_eager
++            )
+         except ValueError as e:
+             raise HTTPException(
+                 status_code=HTTPStatus.BAD_REQUEST.value,
+@@ -394,6 +398,14 @@
+         gen_params.lora_request = lora_request
+         if lora_scale is not None:
+             gen_params.lora_scale = lora_scale
++        try:
++            entry = resolve_adapter(lora_request.lora_name)
++            enforce_turbo_schedule(gen_params, entry)
++        except ValueError as e:
++            raise HTTPException(
++                status_code=HTTPStatus.BAD_REQUEST.value,
++                detail=str(e),
++            ) from e
+ 
+     async def _run_generation(
+         self,

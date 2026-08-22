@@ -1,0 +1,151 @@
+--- a/vllm_omni/diffusion/lora/manager.py
++++ b/vllm_omni/diffusion/lora/manager.py
+@@ -28,6 +28,7 @@
+     _match_target_modules,
+     from_layer_diffusion,
+ )
++from h3_multinode.lora_wrap import packed_modules_list_for_layer, wrap_diffusion_linear
+ from vllm_omni.lora.utils import stable_lora_int_id
+ 
+ logger = init_logger(__name__)
+@@ -329,13 +330,7 @@
+         `packed_modules_list` length to decide between single-slice vs packed
+         LoRA layer implementations.
+         """
+-        if isinstance(module, QKVParallelLinear):
+-            # Treat diffusion QKV as a 3-slice packed projection by default.
+-            return ["q", "k", "v"]
+-        if isinstance(module, MergedColumnParallelLinear):
+-            # 2-slice packed projection (e.g. fused MLP projections).
+-            return ["0", "1"]
+-        return []
++        return packed_modules_list_for_layer(module)
+ 
+     def _replace_layers_with_lora(self, peft_helper: PEFTHelper) -> None:
+         self._ensure_max_lora_rank(peft_helper.r)
+@@ -422,18 +417,26 @@
+                 pending_replacements.append((module_name, full_module_name, module, packed_modules_list))
+ 
+             for module_name, full_module_name, module, packed_modules_list in pending_replacements:
+-                lora_layer = from_layer_diffusion(
+-                    layer=module,
+-                    max_loras=1,
+-                    lora_config=lora_config,
+-                    packed_modules_list=packed_modules_list,
+-                    model_config=None,
+-                )
++                lora_layer = wrap_diffusion_linear(module, lora_config, max_loras=1)
++                if lora_layer is module:
++                    lora_layer = from_layer_diffusion(
++                        layer=module,
++                        max_loras=1,
++                        lora_config=lora_config,
++                        packed_modules_list=packed_modules_list,
++                        model_config=None,
++                    )
+ 
+                 if lora_layer is not module and isinstance(lora_layer, BaseLayerWithLoRA):
+                     replace_submodule(component, module_name, lora_layer)
+                     self._lora_modules[full_module_name] = lora_layer
+                     logger.debug("Replaced layer: %s -> %s", full_module_name, type(lora_layer).__name__)
++            suffixes = sorted({name.split(".")[-1] for name in self._lora_modules})
++            logger.info(
++                "Replaced %d LoRA layers covering %s",
++                len(self._lora_modules),
++                suffixes,
++            )
+ 
+     def _ensure_max_lora_rank(self, min_rank: int) -> None:
+         """Ensure LoRA buffers can accommodate adapters up to `min_rank`.
+@@ -522,6 +525,9 @@
+ 
+         logger.info("Activating adapter: id=%d", adapter_id)
+         lora_model = self._registered_adapters[adapter_id]
++        n_set = 0
++        n_reset = 0
++        qkv_amean = None
+ 
+         # activate weights in each LoRA layer
+         for full_module_name, lora_layer in self._lora_modules.items():
+@@ -533,6 +539,7 @@
+                     prefix, _, packed_suffix = full_module_name.rpartition(".")
+                     sub_suffixes = self._get_packed_sublayer_suffixes(packed_suffix, n_slices)
+                     if sub_suffixes is None:
++                        n_reset += 1
+                         lora_layer.reset_lora(0)
+                         continue
+ 
+@@ -549,6 +556,7 @@
+                         sub_loras.append(sub_lora if isinstance(sub_lora, LoRALayerWeights) else None)
+ 
+                     if not any_found:
++                        n_reset += 1
+                         lora_layer.reset_lora(0)
+                         continue
+ 
+@@ -562,7 +570,10 @@
+                         lora_a_list.append(sub_lora.lora_a)
+                         lora_b_list.append(sub_lora.lora_b * scale)
+ 
++                    n_set += 1
+                     lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
++                    if qkv_amean is None and full_module_name.endswith(".qkv_proj") and getattr(lora_layer, "lora_a_stacked", None):
++                        qkv_amean = float(lora_layer.lora_a_stacked[0][0, 0].abs().mean())
+                     logger.debug(
+                         "Activated packed LoRA for %s via submodules=%s (scale=%.2f)",
+                         full_module_name,
+@@ -570,6 +581,7 @@
+                         scale,
+                     )
+                 else:
++                    n_reset += 1
+                     lora_layer.reset_lora(0)
+                 continue
+ 
+@@ -580,6 +592,7 @@
+                     None if b is None else b * scale  # type: ignore[operator]
+                     for b in lora_weights.lora_b
+                 ]
++                n_set += 1
+                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                 logger.debug(
+                     "Activated packed LoRA for %s (scale=%.2f)",
+@@ -593,6 +606,7 @@
+             if n_slices > 1:
+                 output_slices = getattr(lora_layer, "output_slices", None)
+                 if output_slices is None:
++                    n_reset += 1
+                     lora_layer.reset_lora(0)
+                     continue
+ 
+@@ -604,12 +618,14 @@
+                         lora_weights.lora_b.shape[0],
+                         total,
+                     )
++                    n_reset += 1
+                     lora_layer.reset_lora(0)
+                     continue
+ 
+                 b_splits = list(torch.split(lora_weights.lora_b, list(output_slices), dim=0))
+                 lora_a_list = [lora_weights.lora_a] * n_slices
+                 lora_b_list = [b * scale for b in b_splits]
++                n_set += 1
+                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                 logger.debug(
+                     "Activated fused LoRA for packed layer %s (scale=%.2f)",
+@@ -630,6 +646,15 @@
+ 
+         self._active_adapter_id = adapter_id
+         self._update_adapter_scale(adapter_id, scale)
++        logger.info(
++            "LoRA activate complete: set=%d reset=%d wrapped_layers=%d adapter=%d scale=%.3f qkv_A_absmean=%s",
++            n_set,
++            n_reset,
++            len(self._lora_modules),
++            adapter_id,
++            scale,
++            qkv_amean,
++        )
+ 
+     def _deactivate_all_adapters(self) -> None:
+         if self._active_adapter_id is None:

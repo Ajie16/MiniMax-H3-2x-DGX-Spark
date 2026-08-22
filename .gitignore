@@ -8,3 +8,4 @@ logs/*
 output/*
 !output/.gitkeep
 results/
+loras/

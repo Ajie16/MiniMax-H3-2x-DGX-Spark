@@ -38,6 +38,8 @@ h3_require_nonnegative_integer H3_WORKER_GID_INDEX "$WORKER_GID"
 h3_require_ipv4 HEAD_IP "$HEAD_IP"
 h3_require_ipv4 WORKER_IP "$WORKER_IP"
 h3_require_port H3_API_PORT "$API_PORT"
+h3_validate_lora_profile
+h3_preflight_lora_artifacts
 
 check_node() {
   local host="$1" expected="$2" gid="$3"

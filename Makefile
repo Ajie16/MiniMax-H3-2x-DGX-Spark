@@ -1,4 +1,4 @@
-.PHONY: audit build down smoke status test verify
+.PHONY: audit build down smoke status test verify lora-profile-test
 
 audit:
 	./scripts/public-audit.sh
@@ -15,7 +15,10 @@ smoke:
 verify:
 	./scripts/verify-output.sh output/smoke-t2va-2x.mp4
 
-test:
+lora-profile-test:
+	./tests/test-lora-profile-validation.sh
+
+test: lora-profile-test
 	docker run --rm --network none --entrypoint python \
 		-e PYTHONDONTWRITEBYTECODE=1 \
 		-v "$(CURDIR):/workspace:ro" -w /workspace \
