@@ -18,6 +18,26 @@ from .worker import RayDiffusionWorker
 logger = init_logger(__name__)
 
 
+def is_busy_actor_timeout(exc: BaseException) -> bool:
+    """True when a short Ray ping timeout means the actor is busy, not dead.
+
+    RayDiffusionWorker is a single-threaded actor. ping() queues behind
+    execute_model, so a 10s ray.get timeout during generate is expected.
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    return type(exc).__name__ == "GetTimeoutError"
+
+
+def interpret_health_rpc(exc: BaseException | None, ranks: list[int] | None) -> str:
+    """Classify a worker ping result as 'ok', 'busy', or 'dead'."""
+    if exc is not None:
+        if is_busy_actor_timeout(exc):
+            return "busy"
+        return "dead"
+    if ranks is None or sorted(ranks) != [0, 1]:
+        return "dead"
+    return "ok"
 
 
 def _required_env(name: str, default: str | None = None) -> str:
@@ -39,6 +59,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
         self._ray = ray
         self._closed = False
         self._is_failed = False
+        self._rpc_in_flight = 0
         self._failure_callbacks: list[Callable[[], None]] = []
         self._actors: list[Any] = []
 
@@ -193,25 +214,28 @@ class RayDiffusionExecutor(DiffusionExecutor):
         self._ensure_open()
         kwargs = kwargs or {}
         execute_all = unique_reply_rank is None or exec_all_ranks
-
-        refs = []
-        for rank, actor in enumerate(self._actors):
-            should_execute = execute_all or unique_reply_rank is None or rank == unique_reply_rank
-            refs.append(
-                actor.execute.remote(
-                    method=method,
-                    args=args,
-                    kwargs=kwargs,
-                    output_rank=unique_reply_rank,
-                    execute=should_execute,
-                )
-            )
-
+        self._rpc_in_flight += 1
         try:
-            replies = self._ray.get(refs, timeout=timeout)
-        except BaseException:
-            self._mark_failed()
-            raise
+            refs = []
+            for rank, actor in enumerate(self._actors):
+                should_execute = execute_all or unique_reply_rank is None or rank == unique_reply_rank
+                refs.append(
+                    actor.execute.remote(
+                        method=method,
+                        args=args,
+                        kwargs=kwargs,
+                        output_rank=unique_reply_rank,
+                        execute=should_execute,
+                    )
+                )
+
+            try:
+                replies = self._ray.get(refs, timeout=timeout)
+            except BaseException:
+                self._mark_failed()
+                raise
+        finally:
+            self._rpc_in_flight -= 1
 
         failures = [reply for reply in replies if not reply.get("ok")]
         if failures:
@@ -273,14 +297,28 @@ class RayDiffusionExecutor(DiffusionExecutor):
 
     def check_health(self) -> None:
         self._ensure_open()
+        if self._rpc_in_flight > 0:
+            # Do not queue ping behind execute_model; that 10s timeout used to
+            # mark the engine dead and abort a live 4-step generate.
+            logger.debug("skipping worker ping; generate RPC in flight")
+            return
+        exc: BaseException | None = None
+        ranks: list[int] | None = None
         try:
             ready = self._ray.get([actor.ping.remote() for actor in self._actors], timeout=10)
-        except BaseException as exc:
-            self._mark_failed()
+            ranks = [item.get("rank") for item in ready]
+        except BaseException as err:
+            exc = err
+        outcome = interpret_health_rpc(exc, ranks)
+        if outcome == "ok":
+            return
+        if outcome == "busy":
+            logger.debug("distributed worker ping timed out; actors may be busy generating")
+            return
+        self._mark_failed()
+        if exc is not None:
             raise EngineDeadError("MiniMax H3 distributed worker health check failed") from exc
-        if sorted(item.get("rank") for item in ready) != [0, 1]:
-            self._mark_failed()
-            raise EngineDeadError(f"Unexpected worker health response: {ready}")
+        raise EngineDeadError(f"Unexpected worker health response: {ranks}")
 
     def shutdown(self) -> None:
         if self._closed:
