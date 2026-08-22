@@ -133,7 +133,12 @@
                  lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
                  logger.debug(
                      "Activated fused LoRA for packed layer %s (scale=%.2f)",
-@@ -630,6 +646,15 @@
+@@ -621,3 +637,4 @@
+             scaled_lora_b = lora_weights.lora_b * scale
++            n_set += 1
+             lora_layer.set_lora(index=0, lora_a=lora_weights.lora_a, lora_b=scaled_lora_b)
+             logger.debug(
+@@ -630,6 +647,15 @@
  
          self._active_adapter_id = adapter_id
          self._update_adapter_scale(adapter_id, scale)
