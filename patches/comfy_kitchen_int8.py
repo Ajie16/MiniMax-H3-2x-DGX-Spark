@@ -11,9 +11,20 @@ float32 scale, then calls ``torch.ops.comfy_kitchen.int8_linear`` at runtime.
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+import os
+import sys
+
 import torch
 
-from vllm.model_executor.layers.linear import LinearMethodBase
+# Import comfy_kitchen to trigger backend (CUDA/eager/triton) op registration.
+# Without this, torch.ops.comfy_kitchen.int8_linear is not available at runtime.
+import comfy_kitchen  # noqa: F401
+from comfy_kitchen.registry import registry
+
+from vllm.model_executor.layers.linear import (
+    LinearMethodBase,
+    register_weight_loader_v2_supported_method,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
@@ -64,8 +75,12 @@ class ComfyKitchenINT8Config(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> LinearMethodBase | None:
-        del layer, prefix  # unused
-        return ComfyKitchenINT8LinearMethod(self)
+        del layer  # unused
+        # Comfy-Org INT8 checkpoints use convrot_groupsize=256 for attention/MLP
+        # weights and convrot_groupsize=64 for the DiT-block AdaLN projection
+        # (its input dimension 2688 is divisible by 64 but not by 256).
+        group_size = 64 if "adaln_proj.linear" in prefix else 256
+        return ComfyKitchenINT8LinearMethod(self, group_size=group_size)
 
     def get_scaled_act_names(self) -> list[str]:
         return []
@@ -81,8 +96,9 @@ class ComfyKitchenINT8ScaleParameter(_ColumnvLLMParameter):
     """
 
     def __init__(self, **kwargs: Any) -> None:
-        # Do not set input_dim; the v1 row-parallel weight loader then skips
-        # input-dim narrowing and copies the full [N_per_rank, 1] tensor.
+        # Do not set input_dim; both v1 and v2 row-parallel loaders skip
+        # input-dim narrowing when it is absent and copy the full
+        # [N_per_rank, 1] scale tensor.
         kwargs.pop("input_dim", None)
         super().__init__(**kwargs)
 
@@ -90,11 +106,17 @@ class ComfyKitchenINT8ScaleParameter(_ColumnvLLMParameter):
         self._assert_and_load(loaded_weight)
 
 
+@register_weight_loader_v2_supported_method
 class ComfyKitchenINT8LinearMethod(LinearMethodBase):
     """Linear method that runs INT8 ConvRot weights through comfy_kitchen."""
 
-    def __init__(self, quant_config: ComfyKitchenINT8Config) -> None:
+    def __init__(
+        self,
+        quant_config: ComfyKitchenINT8Config,
+        group_size: int = 256,
+    ) -> None:
         self.quant_config = quant_config
+        self.group_size = group_size
 
     def create_weights(
         self,
@@ -150,6 +172,29 @@ class ComfyKitchenINT8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        prefix = getattr(layer, "prefix", "<unknown>")
+        if os.environ.get("H3_INT8_DEBUG") == "1":
+            print(
+                f"[INT8 DEBUG] {prefix} x={tuple(x.shape)}:{x.dtype}:{x.device} "
+                f"w={tuple(layer.weight.shape)}:{layer.weight.dtype}:{layer.weight.device} "
+                f"s={tuple(layer.weight_scale.shape)}:{layer.weight_scale.dtype}:{layer.weight_scale.device} "
+                f"bias={bias is not None} group={self.group_size}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        if os.environ.get("H3_INT8_EAGER") == "1":
+            with registry.use_backend("eager"):
+                return torch.ops.comfy_kitchen.int8_linear(
+                    x.contiguous(),
+                    layer.weight,
+                    layer.weight_scale,
+                    bias,
+                    _dtype_code(x.dtype),
+                    True,  # convrot
+                    self.group_size,
+                )
+
         return torch.ops.comfy_kitchen.int8_linear(
             x.contiguous(),
             layer.weight,
@@ -157,5 +202,5 @@ class ComfyKitchenINT8LinearMethod(LinearMethodBase):
             bias,
             _dtype_code(x.dtype),
             True,  # convrot
-            256,
+            self.group_size,
         )

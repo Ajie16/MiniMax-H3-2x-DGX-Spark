@@ -5,10 +5,25 @@ H3_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 h3_load_env() {
   local env_file="$H3_PROJECT_ROOT/.env"
   if [[ -f "$env_file" ]]; then
+    # Preserve any caller-provided overrides so command-line exports win over .env.
+    local -a preserved=(HEAD_HOST WORKER_HOST HEAD_IP WORKER_IP H3_QUANTIZATION MINIMAX_H3_MODEL_DIR)
+    local var saved
+    declare -A h3_env_overrides
+    for var in "${preserved[@]}"; do
+      if [[ -n "${!var:-}" ]]; then
+        h3_env_overrides[$var]="${!var}"
+      fi
+    done
     set -a
     # shellcheck disable=SC1090
     source "$env_file"
     set +a
+    for var in "${preserved[@]}"; do
+      if [[ -n "${h3_env_overrides[$var]:-}" ]]; then
+        printf -v "$var" '%s' "${h3_env_overrides[$var]}"
+        export "$var"
+      fi
+    done
   fi
 }
 

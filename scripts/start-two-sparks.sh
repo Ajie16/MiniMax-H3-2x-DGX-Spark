@@ -195,9 +195,21 @@ if [[ "$LORA_MODE" != off ]]; then
   ssh "$WORKER_HOST" "mkdir -p $(printf '%q' "$REF_MEDIA_DIR")"
 fi
 
+# INT8 model directories reuse the text encoder / VAE / tokenizer from a sibling
+# Ref2VA tree via symlinks.  Mount that tree at the same absolute path so the
+# symlinks resolve inside the containers.
+shared_model_dir=""
+shared_model_vol=""
+if [[ "$(basename "$MODEL_DIR")" == *-INT8 ]]; then
+  shared_model_dir="$(dirname "$MODEL_DIR")/Ref2VA"
+  if [[ -d "$shared_model_dir" ]]; then
+    shared_model_vol="-v '$shared_model_dir':'$shared_model_dir':ro"
+  fi
+fi
+
 # Validated values are intentionally expanded on the client for remote Docker.
 # shellcheck disable=SC2029
-ssh "$HEAD_HOST" "docker run -d --name minimax-h3-2x-ray-head --network host --ipc host --gpus all --device /dev/infiniband --cap-add IPC_LOCK $head_common -v minimax-h3-2x-ray-tmp:/tmp/ray -v '$MODEL_DIR':'$MODEL_DIR':ro -v '$HF_CACHE':/root/.cache/huggingface $lora_vol --entrypoint ray '$IMAGE' start --head --node-ip-address='$HEAD_IP' --port='$RAY_PORT' --dashboard-host='$HEAD_IP' --dashboard-port=8265 --num-cpus=8 --num-gpus=1 --object-store-memory=2000000000 --disable-usage-stats --block >/dev/null"
+ssh "$HEAD_HOST" "docker run -d --name minimax-h3-2x-ray-head --network host --ipc host --gpus all --device /dev/infiniband --cap-add IPC_LOCK $head_common -v minimax-h3-2x-ray-tmp:/tmp/ray -v '$MODEL_DIR':'$MODEL_DIR':ro $shared_model_vol -v '$HF_CACHE':/root/.cache/huggingface $lora_vol --entrypoint ray '$IMAGE' start --head --node-ip-address='$HEAD_IP' --port='$RAY_PORT' --dashboard-host='$HEAD_IP' --dashboard-port=8265 --num-cpus=8 --num-gpus=1 --object-store-memory=2000000000 --disable-usage-stats --block >/dev/null"
 
 for _ in $(seq 1 30); do
   if ssh "$HEAD_HOST" "docker exec minimax-h3-2x-ray-head ray status" >/dev/null 2>&1; then
@@ -212,7 +224,7 @@ test "${ray_head_ready:-0}" = 1 || {
 }
 
 # shellcheck disable=SC2029
-ssh "$WORKER_HOST" "docker run -d --name minimax-h3-2x-ray-worker --network host --ipc host --gpus all --device /dev/infiniband --cap-add IPC_LOCK $worker_common -v minimax-h3-2x-ray-worker-tmp:/tmp/ray -v '$MODEL_DIR':'$MODEL_DIR':ro -v '$HF_CACHE':/root/.cache/huggingface $lora_vol --entrypoint ray '$IMAGE' start --address='$HEAD_IP:$RAY_PORT' --node-ip-address='$WORKER_IP' --num-cpus=8 --num-gpus=1 --object-store-memory=2000000000 --disable-usage-stats --block >/dev/null"
+ssh "$WORKER_HOST" "docker run -d --name minimax-h3-2x-ray-worker --network host --ipc host --gpus all --device /dev/infiniband --cap-add IPC_LOCK $worker_common -v minimax-h3-2x-ray-worker-tmp:/tmp/ray -v '$MODEL_DIR':'$MODEL_DIR':ro $shared_model_vol -v '$HF_CACHE':/root/.cache/huggingface $lora_vol --entrypoint ray '$IMAGE' start --address='$HEAD_IP:$RAY_PORT' --node-ip-address='$WORKER_IP' --num-cpus=8 --num-gpus=1 --object-store-memory=2000000000 --disable-usage-stats --block >/dev/null"
 
 for _ in $(seq 1 60); do
   nodes="$(ssh "$HEAD_HOST" "docker exec minimax-h3-2x-ray-head ray status 2>/dev/null" || true)"
@@ -228,6 +240,6 @@ test "${ray_pair_ready:-0}" = 1 || {
 }
 
 # shellcheck disable=SC2029
-ssh "$HEAD_HOST" "docker run -d --name minimax-h3-2x-api --network host --ipc host --pid=container:minimax-h3-2x-ray-head --gpus all --device /dev/infiniband --cap-add IPC_LOCK $head_common $lora_env_text -e H3_HEAD_IP='$HEAD_IP' -e H3_WORKER_IP='$WORKER_IP' -e H3_HEAD_GID_INDEX='$HEAD_GID' -e H3_WORKER_GID_INDEX='$WORKER_GID' -e H3_RAY_ADDRESS='$HEAD_IP:$RAY_PORT' -e H3_MASTER_PORT='$MASTER_PORT' -e H3_WORKER_START_TIMEOUT=2400 -e H3_API_PORT='$API_PORT' -v minimax-h3-2x-ray-tmp:/tmp/ray -v '$MODEL_DIR':'$MODEL_DIR':ro -v '$HF_CACHE':/root/.cache/huggingface -v '$OUTPUT_DIR':/output $lora_vol --entrypoint vllm '$IMAGE' serve '$MODEL_DIR' --omni --trust-remote-code --host '$HEAD_IP' --port '$API_PORT' --num-gpus 2 --usp 2 --ring 1 --vae-patch-parallel-size 2 --vae-parallel-mode tile --vae-use-tiling --num-weight-load-threads 2 --text-encoder-tp-size '$TE_TP_SIZE' $execution_args_text $cache_args_text --diffusion-attention-backend '$ATTENTION_BACKEND' $quant_args_text --distributed-executor-backend ray --stage-init-timeout 1800 --init-timeout 2400 >/dev/null"
+ssh "$HEAD_HOST" "docker run -d --name minimax-h3-2x-api --network host --ipc host --pid=container:minimax-h3-2x-ray-head --gpus all --device /dev/infiniband --cap-add IPC_LOCK $head_common $lora_env_text -e H3_HEAD_IP='$HEAD_IP' -e H3_WORKER_IP='$WORKER_IP' -e H3_HEAD_GID_INDEX='$HEAD_GID' -e H3_WORKER_GID_INDEX='$WORKER_GID' -e H3_RAY_ADDRESS='$HEAD_IP:$RAY_PORT' -e H3_MASTER_PORT='$MASTER_PORT' -e H3_WORKER_START_TIMEOUT=2400 -e H3_API_PORT='$API_PORT' -v minimax-h3-2x-ray-tmp:/tmp/ray -v '$MODEL_DIR':'$MODEL_DIR':ro $shared_model_vol -v '$HF_CACHE':/root/.cache/huggingface -v '$OUTPUT_DIR':/output $lora_vol --entrypoint vllm '$IMAGE' serve '$MODEL_DIR' --omni --trust-remote-code --host '$HEAD_IP' --port '$API_PORT' --num-gpus 2 --usp 2 --ring 1 --vae-patch-parallel-size 2 --vae-parallel-mode tile --vae-use-tiling --num-weight-load-threads 2 --text-encoder-tp-size '$TE_TP_SIZE' $execution_args_text $cache_args_text --diffusion-attention-backend '$ATTENTION_BACKEND' $quant_args_text --distributed-executor-backend ray --stage-init-timeout 1800 --init-timeout 2400 >/dev/null"
 
 echo "two-Spark H3 launch started: attention=$ATTENTION_BACKEND execution=$EXECUTION_MODE cache=$CACHE_BACKEND te_tp=$TE_TP_SIZE quant=$QUANTIZATION; API will appear at http://$HEAD_IP:$API_PORT/v1 after both ranks load"

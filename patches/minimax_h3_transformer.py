@@ -909,7 +909,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 f"{ulysses_degree} != 0"
             )
 
-        # INT8 only quantizes DiT block attention/MLP weights; keep patch
+        # INT8 only quantizes DiT block attention/MLP/AdaLN weights; keep patch
         # projections, condition projection, time embedder, token refiner,
         # and final layer in bf16/fp32.
         non_int8_config = _non_int8_quant_config(quant_config)
