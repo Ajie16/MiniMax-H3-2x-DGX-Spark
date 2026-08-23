@@ -165,6 +165,9 @@ class ComfyKitchenINT8LinearMethod(LinearMethodBase):
             layer.weight.data = layer.weight.data.contiguous()
         if not layer.weight_scale.is_contiguous():
             layer.weight_scale.data = layer.weight_scale.data.contiguous()
+        # Ensure scale stays float32; some loaders may cast it accidentally.
+        if layer.weight_scale.dtype != torch.float32:
+            layer.weight_scale.data = layer.weight_scale.data.to(torch.float32)
 
     def apply(
         self,
@@ -183,12 +186,23 @@ class ComfyKitchenINT8LinearMethod(LinearMethodBase):
                 flush=True,
             )
 
+        # Defensive: the CUDA kernel assumes contiguous operands on the same
+        # device. vLLM's process_weights_after_loading already handles this,
+        # but replicate it cheaply here in case a preceding transform changed
+        # layout.
+        weight = layer.weight if layer.weight.is_contiguous() else layer.weight.contiguous()
+        weight_scale = layer.weight_scale if layer.weight_scale.is_contiguous() else layer.weight_scale.contiguous()
+        if weight.device != x.device:
+            weight = weight.to(x.device)
+        if weight_scale.device != x.device:
+            weight_scale = weight_scale.to(x.device)
+
         if os.environ.get("H3_INT8_EAGER") == "1":
             with registry.use_backend("eager"):
                 return torch.ops.comfy_kitchen.int8_linear(
                     x.contiguous(),
-                    layer.weight,
-                    layer.weight_scale,
+                    weight,
+                    weight_scale,
                     bias,
                     _dtype_code(x.dtype),
                     True,  # convrot
@@ -197,8 +211,8 @@ class ComfyKitchenINT8LinearMethod(LinearMethodBase):
 
         return torch.ops.comfy_kitchen.int8_linear(
             x.contiguous(),
-            layer.weight,
-            layer.weight_scale,
+            weight,
+            weight_scale,
             bias,
             _dtype_code(x.dtype),
             True,  # convrot
