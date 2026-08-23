@@ -65,8 +65,8 @@ case "$TE_TP_SIZE" in
   *) h3_fail "H3_TEXT_ENCODER_TP_SIZE must be 1 or 2" ;;
 esac
 case "$QUANTIZATION" in
-  fp8|bf16) ;;
-  *) h3_fail "H3_QUANTIZATION must be fp8 or bf16" ;;
+  fp8|bf16|int8_convrot) ;;
+  *) h3_fail "H3_QUANTIZATION must be fp8, bf16, or int8_convrot" ;;
 esac
 case "$CACHE_BACKEND" in
   none|cache_dit) ;;
@@ -124,6 +124,7 @@ COMMON_ENV=(
   -e RAY_health_check_failure_threshold=30
   -e RAY_health_check_period_ms=5000
   -e RAY_health_check_timeout_ms=30000
+  -e H3_QUANTIZATION="$QUANTIZATION"
 )
 if [[ "$LORA_MODE" != off ]]; then
   COMMON_ENV+=(

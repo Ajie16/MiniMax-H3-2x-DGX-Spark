@@ -49,6 +49,7 @@ from .condition_noise import (
 from .denoise_loop import MiniMaxH3DenoiseBranch, minimax_h3_denoise_loop
 from .encoder import MiniMaxH3Qwen3VLEncoder
 from .minimax_h3_transformer import MiniMaxH3DiTModel
+from .comfy_kitchen_int8 import ComfyKitchenINT8Config
 from .packed_sequence import (
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
@@ -288,9 +289,12 @@ class MiniMaxH3Pipeline(
                 fall_back_to_pt=False,
             )
         ]
+        quant_config = od_config.quantization_config
+        if os.environ.get("H3_QUANTIZATION") == "int8_convrot":
+            quant_config = ComfyKitchenINT8Config()
         self.transformer = MiniMaxH3DiTModel(
             od_config,
-            quant_config=od_config.quantization_config,
+            quant_config=quant_config,
         )
 
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(

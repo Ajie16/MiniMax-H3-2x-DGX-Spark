@@ -15,7 +15,12 @@ LABEL org.opencontainers.image.base.name="${H3_UPSTREAM_BASE_IMAGE}" \
 
 RUN python -m pip install --no-cache-dir "ray[default]==2.56.1"
 
+# comfy-kitchen provides the INT8 ConvRot W8A8 GEMM used by the H3_QUANTIZATION=int8_convrot path.
+RUN python -m pip install --no-cache-dir "comfy-kitchen==0.2.31"
+
 COPY h3_multinode /opt/h3-multinode/h3_multinode
+COPY patches/comfy_kitchen_int8.py /usr/local/lib/python3.12/dist-packages/vllm_omni/diffusion/models/minimax_h3/comfy_kitchen_int8.py
+COPY patches/minimax_h3_transformer.py /usr/local/lib/python3.12/dist-packages/vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py
 COPY patches/enable-ray-diffusion-executor.patch /tmp/enable-ray-diffusion-executor.patch
 COPY patches/enable-lora-catalog.patch /tmp/enable-lora-catalog.patch
 COPY patches/fix-h3-sigma-nfe.patch /tmp/fix-h3-sigma-nfe.patch
