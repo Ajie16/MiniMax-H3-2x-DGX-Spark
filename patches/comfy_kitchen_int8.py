@@ -201,20 +201,24 @@ class ComfyKitchenINT8LinearMethod(LinearMethodBase):
         # and convrot_groupsize=64 for the AdaLN projections whose input dim
         # (2688) is not divisible by 256.  Fall back to a divisor of the actual
         # weight K dimension when the configured group size would not divide it.
+        # comfy-kitchen's Hadamard construction requires the group size to be a
+        # power of 4 (4, 16, 64, 256, ...), so only those divisors are eligible.
         k_features = weight.shape[1]
         group_size = self.group_size
+        fallback = False
         if k_features % group_size != 0:
-            for candidate in (256, 128, 64, 32):
+            fallback = True
+            for candidate in (256, 64, 16, 4):
                 if k_features % candidate == 0:
                     group_size = candidate
                     break
             else:
                 raise ValueError(
                     f"INT8 ConvRot features {k_features} not divisible by any "
-                    f"supported group_size for {prefix}"
+                    f"power-of-4 group_size for {prefix}"
                 )
 
-        if os.environ.get("H3_INT8_DEBUG") == "1":
+        if os.environ.get("H3_INT8_DEBUG") == "1" or "adaln_proj" in prefix or fallback:
             print(
                 f"[INT8 DEBUG] {prefix} x={tuple(x.shape)}:{x.dtype}:{x.device} "
                 f"w={tuple(weight.shape)}:{weight.dtype}:{weight.device} "
