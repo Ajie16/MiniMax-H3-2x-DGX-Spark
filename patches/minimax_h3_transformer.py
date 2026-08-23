@@ -51,11 +51,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# comfy-kitchen INT8 ConvRot path.  Only DiT block attention/MLP weights are
-# stored as int8; everything else stays bf16/fp32.
+# comfy-kitchen INT8 ConvRot path.  DiT block attention/MLP/AdaLN projection
+# weights are stored as int8; everything else stays bf16/fp32.
 _USE_INT8 = os.environ.get("H3_QUANTIZATION") == "int8_convrot"
 _INT8_QUANTIZED_LAYER_RE = re.compile(
-    r"^blocks\.\d+\.(attn\.(qkv_proj|out_proj)|mlp\.(fc1|fc2))$"
+    r"^blocks\.\d+\.(attn\.(qkv_proj|out_proj)|mlp\.(fc1|fc2)|adaln_proj\.linear)$"
 )
 
 
@@ -681,10 +681,12 @@ class MiniMaxH3DiTBlock(nn.Module):
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.attn = MiniMaxH3Attention(arch, quant_config)
         self.mlp = MiniMaxH3MLP(arch, quant_config)
+        # DiT-block AdaLN projection is part of the INT8 checkpoint; the
+        # final-layer AdaLN projection stays bf16/fp16 and is handled below.
         self.adaln_proj = MiniMaxH3AdalnProj(
             arch,
             arch.adaln_out_features,
-            _non_int8_quant_config(quant_config),
+            quant_config,
             expand_ratio=6,
             modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
         )
