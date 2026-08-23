@@ -16,6 +16,7 @@ BASE_IMAGE="${H3_BASE_IMAGE:-minimax-h3-dgx-spark:sm121-fp8}"
 EXPECTED_BASE_IMAGE_ID="sha256:e498adce4d08a27d88f7c2a23a50563d508815cb78f12442a765326e661e2146"
 UPSTREAM_BASE_IMAGE="vllm/vllm-omni:minimax-h3@sha256:e930db8e225162d01e17a49dddc43fd0e844208908d8356a028e5c4e7357696e"
 COMPANION_REPO_COMMIT="8bd7628dbdb51a0ea00c301ddcb1a098874870e4"
+HEAD_HOST="${HEAD_HOST:-spark-head}"
 WORKER_HOST="${WORKER_HOST:-spark-peer}"
 SYNC_WORKER="${SYNC_WORKER:-1}"
 PROJECT_DIR="$H3_PROJECT_ROOT"
@@ -27,6 +28,7 @@ case "$SYNC_WORKER" in
   0) ;;
   1)
     h3_require_command ssh
+    h3_require_safe_value HEAD_HOST "$HEAD_HOST"
     h3_require_safe_value WORKER_HOST "$WORKER_HOST"
     ;;
   *) h3_fail "SYNC_WORKER must be 0 or 1" ;;
@@ -81,14 +83,26 @@ docker run --rm --network none --entrypoint python \
   "$IMAGE" /tmp/check-runtime-versions.py
 
 if [[ "$SYNC_WORKER" == 1 ]]; then
-  docker save "$IMAGE" | ssh "$WORKER_HOST" docker load
   head_id="$(docker image inspect "$IMAGE" --format '{{.Id}}')"
-  # Values interpolated into this remote command passed h3_require_safe_value.
-  # shellcheck disable=SC2029
-  worker_id="$(ssh "$WORKER_HOST" "docker image inspect '$IMAGE' --format '{{.Id}}'")"
-  test "$head_id" = "$worker_id"
-  echo "image ready on both Sparks: $IMAGE $head_id"
+  sync_hosts=()
+  for host in "$HEAD_HOST" "$WORKER_HOST"; do
+    # Skip the local host: docker build already produced the image here.
+    if [[ "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+      continue
+    fi
+    sync_hosts+=("$host")
+  done
+  # Deduplicate (HEAD and WORKER may resolve to the same host in tests).
+  mapfile -t sync_hosts < <(printf '%s\n' "${sync_hosts[@]}" | sort -u)
+  for host in "${sync_hosts[@]}"; do
+    docker save "$IMAGE" | ssh "$host" docker load
+    # Values interpolated into this remote command passed h3_require_safe_value.
+    # shellcheck disable=SC2029
+    remote_id="$(ssh "$host" "docker image inspect '$IMAGE' --format '{{.Id}}'")"
+    test "$head_id" = "$remote_id"
+  done
+  echo "image ready on all Sparks: $IMAGE $head_id"
 else
   head_id="$(docker image inspect "$IMAGE" --format '{{.Id}}')"
-  echo "image ready on head only (SYNC_WORKER=0): $IMAGE $head_id"
+  echo "image ready on build host only (SYNC_WORKER=0): $IMAGE $head_id"
 fi
