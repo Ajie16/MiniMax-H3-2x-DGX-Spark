@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Modified 2026 for MiniMax H3 INT8 ConvRot inference via comfy-kitchen.
-"""INT8 ConvRot linear method using comfy_kitchen's fused W8A8 kernel.
+"""INT8 ConvRot linear method using comfy_kitchen's kernels.
 
 This quantization method is intentionally separate from vLLM's built-in FP8
 quantization.  It loads pre-quantized Comfy-Org checkpoints that store
 ``.weight`` as ``torch.int8`` qdata and ``.weight_scale`` as a per-output-row
-float32 scale, then calls ``torch.ops.comfy_kitchen.int8_linear`` at runtime.
+float32 scale.  At runtime it dequantizes the rotated weight to the activation
+dtype and runs a plain GEMM (W8A16) — matching ComfyUI's effective behavior
+when the ref2v LoRA is patched in.  The fused W8A8 kernel
+(``torch.ops.comfy_kitchen.int8_linear``) is available behind
+``H3_INT8_W8A8=1``; it was measured to collapse Ref2VA multi-reference
+generation quality, so W8A16 is the default.
 """
 
 from collections.abc import Iterable, Mapping
@@ -228,6 +233,26 @@ class ComfyKitchenINT8LinearMethod(LinearMethodBase):
                 file=sys.stderr,
                 flush=True,
             )
+
+        # W8A16 (default): dequantize the rotated INT8 weight to the activation
+        # dtype and run a plain GEMM.  This matches ComfyUI's behavior when a
+        # LoRA is patched onto an INT8 layer: cast_bias_weight hands back a
+        # dequantized weight and the layer runs in bf16 with the LoRA merged,
+        # so no activation quantization happens on attention/MLP GEMMs.
+        # Measured on this checkpoint: per-layer relative error drops from
+        # ~1.3% (W8A8) to ~0.9% (weight-only).  Verified 2026-08-24 on the
+        # two-Spark Ref2VA deployment (3 images + audio, 832x480, 2 s,
+        # 4-step turbo): correct scene generation, 82.6 s, peak 77.6 GB.
+        # Set H3_INT8_W8A8=1 to use the fused W8A8 kernel instead; it has
+        # not been re-validated since the checkpoint corruption repair.
+        if os.environ.get("H3_INT8_W8A8") != "1":
+            w = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight_dtype(
+                weight,
+                weight_scale,
+                group_size,
+                _dtype_code(x.dtype),
+            )
+            return torch.nn.functional.linear(x, w, bias)
 
         if os.environ.get("H3_INT8_EAGER") == "1":
             with registry.use_backend("eager"):

@@ -227,11 +227,16 @@ def _prepare_h3_checkpoint_weight(
     replacing a loader with a two-argument closure breaks that replay.
 
     Comfy-Org INT8 ConvRot checkpoints are already in the logical QKV order,
-    so skip the grouped reorder for int8 weights.
+    so skip the grouped reorder for int8 weights. The same holds for the
+    bf16-valued weights inside those checkpoints (e.g. the token_refiner
+    QKV projections, which are stored bf16 but already in logical order),
+    so the reorder is skipped for the whole int8 checkpoint.
     """
     if weight.dtype == torch.int8:
         return weight
     if name.endswith(".attn.qkv_proj.weight"):
+        if _USE_INT8:
+            return weight
         return _reorder_grouped_qkv_to_qkv(
             weight,
             num_query_groups=arch.num_attention_heads,

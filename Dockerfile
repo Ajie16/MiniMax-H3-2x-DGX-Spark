@@ -15,7 +15,7 @@ LABEL org.opencontainers.image.base.name="${H3_UPSTREAM_BASE_IMAGE}" \
 
 RUN python -m pip install --no-cache-dir "ray[default]==2.56.1"
 
-# comfy-kitchen provides the INT8 ConvRot W8A8 GEMM used by the H3_QUANTIZATION=int8_convrot path.
+# comfy-kitchen provides the INT8 ConvRot kernels used by the H3_QUANTIZATION=int8_convrot path.
 RUN python -m pip install --no-cache-dir "comfy-kitchen==0.2.31"
 
 COPY h3_multinode /opt/h3-multinode/h3_multinode
