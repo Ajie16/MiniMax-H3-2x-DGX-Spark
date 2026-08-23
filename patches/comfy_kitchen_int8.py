@@ -87,7 +87,7 @@ class ComfyKitchenINT8Config(QuantizationConfig):
                 file=sys.stderr,
                 flush=True,
             )
-        return ComfyKitchenINT8LinearMethod(self, group_size=group_size)
+        return ComfyKitchenINT8LinearMethod(self, group_size=group_size, prefix=prefix)
 
     def get_scaled_act_names(self) -> list[str]:
         return []
@@ -121,9 +121,11 @@ class ComfyKitchenINT8LinearMethod(LinearMethodBase):
         self,
         quant_config: ComfyKitchenINT8Config,
         group_size: int = 256,
+        prefix: str = "",
     ) -> None:
         self.quant_config = quant_config
         self.group_size = group_size
+        self.prefix = prefix
 
     def create_weights(
         self,
@@ -182,16 +184,7 @@ class ComfyKitchenINT8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        prefix = getattr(layer, "prefix", "<unknown>")
-        if os.environ.get("H3_INT8_DEBUG") == "1":
-            print(
-                f"[INT8 DEBUG] {prefix} x={tuple(x.shape)}:{x.dtype}:{x.device} "
-                f"w={tuple(layer.weight.shape)}:{layer.weight.dtype}:{layer.weight.device} "
-                f"s={tuple(layer.weight_scale.shape)}:{layer.weight_scale.dtype}:{layer.weight_scale.device} "
-                f"bias={bias is not None} group={self.group_size}",
-                file=sys.stderr,
-                flush=True,
-            )
+        prefix = self.prefix or getattr(layer, "prefix", "<unknown>")
 
         # Defensive: the CUDA kernel assumes contiguous operands on the same
         # device. vLLM's process_weights_after_loading already handles this,
@@ -204,6 +197,34 @@ class ComfyKitchenINT8LinearMethod(LinearMethodBase):
         if weight_scale.device != x.device:
             weight_scale = weight_scale.to(x.device)
 
+        # The Comfy-Org checkpoint stores convrot_groupsize=256 for most layers
+        # and convrot_groupsize=64 for the AdaLN projections whose input dim
+        # (2688) is not divisible by 256.  Fall back to a divisor of the actual
+        # weight K dimension when the configured group size would not divide it.
+        k_features = weight.shape[1]
+        group_size = self.group_size
+        if k_features % group_size != 0:
+            for candidate in (256, 128, 64, 32):
+                if k_features % candidate == 0:
+                    group_size = candidate
+                    break
+            else:
+                raise ValueError(
+                    f"INT8 ConvRot features {k_features} not divisible by any "
+                    f"supported group_size for {prefix}"
+                )
+
+        if os.environ.get("H3_INT8_DEBUG") == "1":
+            print(
+                f"[INT8 DEBUG] {prefix} x={tuple(x.shape)}:{x.dtype}:{x.device} "
+                f"w={tuple(weight.shape)}:{weight.dtype}:{weight.device} "
+                f"s={tuple(weight_scale.shape)}:{weight_scale.dtype}:{weight_scale.device} "
+                f"bias={bias is not None} configured_group={self.group_size} "
+                f"runtime_group={group_size}",
+                file=sys.stderr,
+                flush=True,
+            )
+
         if os.environ.get("H3_INT8_EAGER") == "1":
             with registry.use_backend("eager"):
                 return torch.ops.comfy_kitchen.int8_linear(
@@ -213,7 +234,7 @@ class ComfyKitchenINT8LinearMethod(LinearMethodBase):
                     bias,
                     _dtype_code(x.dtype),
                     True,  # convrot
-                    self.group_size,
+                    group_size,
                 )
 
         return torch.ops.comfy_kitchen.int8_linear(
@@ -223,5 +244,5 @@ class ComfyKitchenINT8LinearMethod(LinearMethodBase):
             bias,
             _dtype_code(x.dtype),
             True,  # convrot
-            self.group_size,
+            group_size,
         )
