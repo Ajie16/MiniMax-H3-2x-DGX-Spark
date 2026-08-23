@@ -96,9 +96,10 @@ the upstream single-reference rules).
 - Condition-label ordering matches Comfy: images first, then each video
   (soundtrack label before its video label), then standalone audios.
 - Reference-image alignment follows ComfyUI's `ref_image_size` (pass via
-  `extra_params`): `match` (default) scales references to the generation
-  canvas for speed; `max` keeps up to a 2048px short edge for stronger
-  identity fidelity at much higher token cost.
+  `extra_params`): `match` (default) area-matches references to the
+  generation canvas; `max` keeps up to a 2048px short edge for stronger
+  identity fidelity at much higher token cost. Both modes are
+  aspect-preserving and shrink-only, exactly like ComfyUI.
 
   `match` is a **non-uniform** resize to the output canvas: provide reference
   images with the same aspect ratio as `width`/`height`, otherwise the subject

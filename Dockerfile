@@ -22,6 +22,9 @@ COPY patches/fix-h3-sigma-nfe.patch /tmp/fix-h3-sigma-nfe.patch
 COPY patches/enable-lora-wrap.patch /tmp/enable-lora-wrap.patch
 COPY patches/allow-file-audio-url.patch /tmp/allow-file-audio-url.patch
 COPY patches/allow-mixed-ref-inputs.patch /tmp/allow-mixed-ref-inputs.patch
+COPY patches/async-video-encode.patch /tmp/async-video-encode.patch
+COPY patches/ref-encode-posterior-mean.patch /tmp/ref-encode-posterior-mean.patch
+COPY patches/vision-tower-fp32.patch /tmp/vision-tower-fp32.patch
 RUN cd /usr/local/lib/python3.12/dist-packages && \
     patch -p1 < /tmp/enable-ray-diffusion-executor.patch && \
     patch -p1 < /tmp/enable-lora-catalog.patch && \
@@ -29,7 +32,10 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
     patch -p1 < /tmp/enable-lora-wrap.patch && \
     patch -p1 < /tmp/allow-file-audio-url.patch && \
     patch -p1 < /tmp/allow-mixed-ref-inputs.patch && \
-    rm /tmp/enable-ray-diffusion-executor.patch /tmp/enable-lora-catalog.patch /tmp/fix-h3-sigma-nfe.patch /tmp/enable-lora-wrap.patch /tmp/allow-file-audio-url.patch /tmp/allow-mixed-ref-inputs.patch
+    patch -p1 < /tmp/async-video-encode.patch && \
+    patch -p1 < /tmp/ref-encode-posterior-mean.patch && \
+    patch -p1 < /tmp/vision-tower-fp32.patch && \
+    rm /tmp/enable-ray-diffusion-executor.patch /tmp/enable-lora-catalog.patch /tmp/fix-h3-sigma-nfe.patch /tmp/enable-lora-wrap.patch /tmp/allow-file-audio-url.patch /tmp/allow-mixed-ref-inputs.patch /tmp/async-video-encode.patch /tmp/ref-encode-posterior-mean.patch /tmp/vision-tower-fp32.patch
 # Full-file overwrite: Ref2VA multi-reference pipeline (images + videos + audios,
 # Comfy ordering). Applied after the diff patches; no overlap with them.
 COPY patches/minimax_h3_pipeline.py /usr/local/lib/python3.12/dist-packages/vllm_omni/diffusion/models/minimax_h3/pipeline_minimax_h3.py

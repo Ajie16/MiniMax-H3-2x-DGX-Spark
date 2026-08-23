@@ -48,6 +48,7 @@ class AdapterEntry:
     recommended_steps: int | None
     recommended_flow_shift: float | None
     recommended_audio_flow_shift: float | None
+    allowed_steps: tuple[int, ...] | None
     sha256_manifest: str | None
     source: str | None
     source_file: str | None
@@ -143,6 +144,17 @@ def _optional_int(value: Any, *, field: str) -> int | None:
     return value
 
 
+def _optional_steps(value: Any, *, field: str) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise CatalogError(f"{field} must be a non-empty list of integers")
+    steps = tuple(_optional_int(item, field=field) for item in value)
+    if any(step < 1 for step in steps):
+        raise CatalogError(f"{field} entries must be >= 1")
+    return steps
+
+
 def _parse_adapter(name: str, body: Mapping[str, Any]) -> AdapterEntry:
     if not ADAPTER_NAME_RE.match(name):
         raise CatalogError(f"invalid adapter name {name!r}")
@@ -184,6 +196,9 @@ def _parse_adapter(name: str, body: Mapping[str, Any]) -> AdapterEntry:
         recommended_audio_flow_shift=_optional_float(
             body.get("recommended_audio_flow_shift"),
             field=f"adapter {name} recommended_audio_flow_shift",
+        ),
+        allowed_steps=_optional_steps(
+            body.get("allowed_steps"), field=f"adapter {name} allowed_steps"
         ),
         sha256_manifest=manifest,
         source=body.get("source") if isinstance(body.get("source"), str) else None,
@@ -336,9 +351,10 @@ def enforce_turbo_schedule(gen_params: Any, entry: AdapterEntry) -> None:
     if current is None:
         gen_params.num_inference_steps = entry.recommended_steps
         return
-    if int(current) != int(entry.recommended_steps):
+    allowed = entry.allowed_steps or (entry.recommended_steps,)
+    if int(current) not in tuple(int(step) for step in allowed):
         raise CatalogError(
-            f"turbo adapter requires num_inference_steps={entry.recommended_steps}"
+            f"turbo adapter requires num_inference_steps in {list(allowed)}"
         )
 
 

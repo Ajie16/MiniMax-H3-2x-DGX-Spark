@@ -24,6 +24,8 @@ PROJECT_DIR="$H3_PROJECT_ROOT"
 OUTPUT_DIR="${H3_OUTPUT_DIR:-$PROJECT_DIR/output}"
 ATTENTION_BACKEND="${H3_DIFFUSION_ATTENTION_BACKEND:-CUDNN_ATTN}"
 EXECUTION_MODE="${H3_EXECUTION_MODE:-compile}"
+TE_TP_SIZE="${H3_TEXT_ENCODER_TP_SIZE:-1}"
+QUANTIZATION="${H3_QUANTIZATION:-fp8}"
 CACHE_BACKEND="${H3_CACHE_BACKEND:-none}"
 CACHE_CONFIG="${H3_CACHE_CONFIG:-}"
 ENABLE_CACHE_DIT_SUMMARY="${H3_ENABLE_CACHE_DIT_SUMMARY:-false}"
@@ -57,6 +59,14 @@ esac
 case "$EXECUTION_MODE" in
   eager|compile) ;;
   *) h3_fail "H3_EXECUTION_MODE must be eager or compile" ;;
+esac
+case "$TE_TP_SIZE" in
+  1|2) ;;
+  *) h3_fail "H3_TEXT_ENCODER_TP_SIZE must be 1 or 2" ;;
+esac
+case "$QUANTIZATION" in
+  fp8|bf16) ;;
+  *) h3_fail "H3_QUANTIZATION must be fp8 or bf16" ;;
 esac
 case "$CACHE_BACKEND" in
   none|cache_dit) ;;
@@ -155,6 +165,14 @@ cache_args_text=""
 if (( ${#cache_args[@]} )); then
   cache_args_text="$(docker_args_text "${cache_args[@]}")"
 fi
+quant_args=()
+if [[ "$QUANTIZATION" = fp8 ]]; then
+  quant_args+=(--diffusion-quantization-config '{"method":"fp8","activation_scheme":"dynamic","ignored_layers":["video_patch_proj","audio_patch_proj","time_embedder.proj_in","time_embedder.proj_out","final_layer.video_out","final_layer.audio_out"]}' --force-cutlass-fp8)
+fi
+quant_args_text=""
+if (( ${#quant_args[@]} )); then
+  quant_args_text="$(docker_args_text "${quant_args[@]}")"
+fi
 lora_env_text=""
 if [[ "$LORA_MODE" != off ]]; then
   lora_env=()
@@ -209,6 +227,6 @@ test "${ray_pair_ready:-0}" = 1 || {
 }
 
 # shellcheck disable=SC2029
-ssh "$HEAD_HOST" "docker run -d --name minimax-h3-2x-api --network host --ipc host --pid=container:minimax-h3-2x-ray-head --gpus all --device /dev/infiniband --cap-add IPC_LOCK $head_common $lora_env_text -e H3_HEAD_IP='$HEAD_IP' -e H3_WORKER_IP='$WORKER_IP' -e H3_HEAD_GID_INDEX='$HEAD_GID' -e H3_WORKER_GID_INDEX='$WORKER_GID' -e H3_RAY_ADDRESS='$HEAD_IP:$RAY_PORT' -e H3_MASTER_PORT='$MASTER_PORT' -e H3_WORKER_START_TIMEOUT=2400 -e H3_API_PORT='$API_PORT' -v minimax-h3-2x-ray-tmp:/tmp/ray -v '$MODEL_DIR':'$MODEL_DIR':ro -v '$HF_CACHE':/root/.cache/huggingface -v '$OUTPUT_DIR':/output $lora_vol --entrypoint vllm '$IMAGE' serve '$MODEL_DIR' --omni --trust-remote-code --host '$HEAD_IP' --port '$API_PORT' --num-gpus 2 --usp 2 --ring 1 --vae-patch-parallel-size 2 --vae-parallel-mode tile --vae-use-tiling --num-weight-load-threads 2 $execution_args_text $cache_args_text --diffusion-attention-backend '$ATTENTION_BACKEND' --diffusion-quantization-config '{\"method\":\"fp8\",\"activation_scheme\":\"dynamic\",\"ignored_layers\":[\"video_patch_proj\",\"audio_patch_proj\",\"time_embedder.proj_in\",\"time_embedder.proj_out\",\"final_layer.video_out\",\"final_layer.audio_out\"]}' --force-cutlass-fp8 --distributed-executor-backend ray --stage-init-timeout 1800 --init-timeout 2400 >/dev/null"
+ssh "$HEAD_HOST" "docker run -d --name minimax-h3-2x-api --network host --ipc host --pid=container:minimax-h3-2x-ray-head --gpus all --device /dev/infiniband --cap-add IPC_LOCK $head_common $lora_env_text -e H3_HEAD_IP='$HEAD_IP' -e H3_WORKER_IP='$WORKER_IP' -e H3_HEAD_GID_INDEX='$HEAD_GID' -e H3_WORKER_GID_INDEX='$WORKER_GID' -e H3_RAY_ADDRESS='$HEAD_IP:$RAY_PORT' -e H3_MASTER_PORT='$MASTER_PORT' -e H3_WORKER_START_TIMEOUT=2400 -e H3_API_PORT='$API_PORT' -v minimax-h3-2x-ray-tmp:/tmp/ray -v '$MODEL_DIR':'$MODEL_DIR':ro -v '$HF_CACHE':/root/.cache/huggingface -v '$OUTPUT_DIR':/output $lora_vol --entrypoint vllm '$IMAGE' serve '$MODEL_DIR' --omni --trust-remote-code --host '$HEAD_IP' --port '$API_PORT' --num-gpus 2 --usp 2 --ring 1 --vae-patch-parallel-size 2 --vae-parallel-mode tile --vae-use-tiling --num-weight-load-threads 2 --text-encoder-tp-size '$TE_TP_SIZE' $execution_args_text $cache_args_text --diffusion-attention-backend '$ATTENTION_BACKEND' $quant_args_text --distributed-executor-backend ray --stage-init-timeout 1800 --init-timeout 2400 >/dev/null"
 
-echo "two-Spark H3 launch started: attention=$ATTENTION_BACKEND execution=$EXECUTION_MODE cache=$CACHE_BACKEND; API will appear at http://$HEAD_IP:$API_PORT/v1 after both ranks load"
+echo "two-Spark H3 launch started: attention=$ATTENTION_BACKEND execution=$EXECUTION_MODE cache=$CACHE_BACKEND te_tp=$TE_TP_SIZE quant=$QUANTIZATION; API will appear at http://$HEAD_IP:$API_PORT/v1 after both ranks load"

@@ -97,8 +97,26 @@ def test_turbo_schedule_rejects_wrong_steps(tmp_path, monkeypatch):
 
     entry = resolve_adapter("turbo4")
     params = SimpleNamespace(num_inference_steps=20)
-    with pytest.raises(CatalogError, match="num_inference_steps=4"):
+    with pytest.raises(CatalogError, match="num_inference_steps in \\[4\\]"):
         enforce_turbo_schedule(params, entry)
     params = SimpleNamespace(num_inference_steps=None)
     enforce_turbo_schedule(params, entry)
     assert params.num_inference_steps == 4
+
+
+def test_turbo_schedule_allowed_steps(tmp_path, monkeypatch):
+    catalog = _write_catalog(tmp_path)
+    body = json.loads(catalog.read_text())
+    body["adapters"]["turbo4"]["allowed_steps"] = [4, 6, 8]
+    catalog.write_text(json.dumps(body))
+    monkeypatch.setenv("H3_LORA_DIR", str(tmp_path))
+    from h3_multinode.lora_catalog import resolve_adapter
+
+    entry = resolve_adapter("turbo4")
+    for steps in (4, 6, 8):
+        params = SimpleNamespace(num_inference_steps=steps)
+        enforce_turbo_schedule(params, entry)
+        assert params.num_inference_steps == steps
+    params = SimpleNamespace(num_inference_steps=5)
+    with pytest.raises(CatalogError, match="num_inference_steps in \\[4, 6, 8\\]"):
+        enforce_turbo_schedule(params, entry)

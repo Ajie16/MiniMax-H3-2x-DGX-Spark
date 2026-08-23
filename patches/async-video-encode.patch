@@ -1,0 +1,20 @@
+--- a/vllm_omni/entrypoints/openai/serving_video.py
++++ b/vllm_omni/entrypoints/openai/serving_video.py
+@@ -3,6 +3,7 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import copy
+ import time
+ from collections.abc import Mapping
+@@ -349,7 +350,8 @@
+             return b"", artifacts.stage_durations, artifacts.peak_memory_mb, action
+ 
+         _t_encode_start = time.perf_counter()
+-        video_bytes = _encode_video_bytes(
++        video_bytes = await asyncio.to_thread(
++            _encode_video_bytes,
+             artifacts.videos[0],
+             fps=artifacts.output_fps,
+             **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),

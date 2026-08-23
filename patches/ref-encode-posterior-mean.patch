@@ -1,0 +1,104 @@
+--- a/vllm_omni/diffusion/models/minimax_h3/vae.py
++++ b/vllm_omni/diffusion/models/minimax_h3/vae.py
+@@ -5,7 +5,7 @@
+ 
+ import importlib
+ import json
+-from contextlib import AbstractContextManager
++from contextlib import AbstractContextManager, contextmanager
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -22,7 +22,6 @@
+ 
+ from .packed_tokens import minimax_h3_patchify_video_latent
+ 
+-MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
+ MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
+ MINIMAX_H3_AUDIO_CHANNELS = 2
+ 
+@@ -53,6 +52,32 @@
+     return component_cls.from_pretrained(component_path)
+ 
+ 
++@contextmanager
++def _posterior_mean_encoding(remote: nn.Module):
++    """Match the reference (ComfyUI) VAE conditioning contract.
++
++    The checkpoint's KL VAE samples from the posterior by default
++    (``DiagonalGaussianDistribution.sample()``). The reference pipeline
++    conditions on the posterior mean instead, computed in FP32. Sampling
++    injects per-request noise into the reference/keyframe latents, which
++    visibly degrades identity and detail retention.
++    """
++    package = remote.__class__.__module__.rsplit(".", 1)[0]
++    vae_module = importlib.import_module(f"{package}.vae_module")
++    distribution = vae_module.DiagonalGaussianDistribution
++    original_sample = distribution.sample
++
++    @torch.compiler.disable
++    def _posterior_mean(self, generator=None):
++        return self.mean
++
++    distribution.sample = _posterior_mean
++    try:
++        yield
++    finally:
++        distribution.sample = original_sample
++
++
+ class _AudioVAEDeterminismContext(AbstractContextManager):
+     def __enter__(self):
+         backends = torch.backends
+@@ -166,16 +191,11 @@
+         previous_dtype = parameter.dtype
+         if previous_dtype != torch.float32:
+             self.to(torch.float32)
+-        devices = [parameter.device] if parameter.device.type == "cuda" else []
+         try:
+-            with torch.random.fork_rng(devices=devices):
+-                torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
+-                for device in devices:
+-                    with torch.cuda.device(device):
+-                        torch.cuda.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
++            with _posterior_mean_encoding(self.remote):
+                 latent = self.model.encode_images(
+                     image,
+-                    use_fp16_latent=True,
++                    use_fp16_latent=False,
+                 )[0]
+         finally:
+             self.model.parallel_tiling = previous_parallel
+@@ -183,9 +203,10 @@
+                 self.to(previous_dtype)
+ 
+         # Match the reference contract exactly: normalization and patchify
+-        # happen on CPU in FP32 after the sampled encode. The condition noise
+-        # path is sensitive enough that doing these elementwise operations on
+-        # CUDA can noticeably change the final conditioned video.
++        # happen on CPU in FP32 after the posterior-mean encode. The
++        # condition noise path is sensitive enough that doing these
++        # elementwise operations on CUDA can noticeably change the final
++        # conditioned video.
+         latent = latent.float().cpu()
+         if latent.ndim == 4:
+             latent = latent[None]
+@@ -210,16 +231,11 @@
+         previous_dtype = parameter.dtype
+         if previous_dtype != torch.float32:
+             self.to(torch.float32)
+-        devices = [parameter.device] if parameter.device.type == "cuda" else []
+         try:
+-            with torch.random.fork_rng(devices=devices):
+-                torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
+-                for device in devices:
+-                    with torch.cuda.device(device):
+-                        torch.cuda.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
++            with _posterior_mean_encoding(self.remote):
+                 latent = self.model.encode_videos(
+                     frames,
+-                    use_fp16_latent=True,
++                    use_fp16_latent=False,
+                 )[0]
+         finally:
+             if previous_dtype != torch.float32:

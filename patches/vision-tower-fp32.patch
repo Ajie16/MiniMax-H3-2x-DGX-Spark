@@ -1,0 +1,16 @@
+--- a/vllm_omni/diffusion/models/minimax_h3/encoder.py
++++ b/vllm_omni/diffusion/models/minimax_h3/encoder.py
+@@ -929,7 +929,12 @@
+         self._tp_size = int(encoder_group.world_size) if encoder_group is not None else 1
+         dtype = torch.bfloat16
+         self.vision = MiniMaxH3Qwen3VLVisionModel(config.vision_config)
+-        self.vision.to(dtype=dtype)
++        # Reference contract (ComfyUI): the vision tower computes in FP32.
++        # Its merged + deepstack features are the only channel carrying
++        # reference-image detail into the text stream; bf16 rounding there
++        # visibly degrades fine textures. Features are cast to the text
++        # dtype at injection (_deepstack_process / embed scattering).
++        self.vision.to(dtype=torch.float32)
+         self.text_model = MiniMaxH3Qwen3VLTextModel(
+             encoder_group,
+             config.text_config,

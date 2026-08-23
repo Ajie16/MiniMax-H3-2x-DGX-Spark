@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from collections.abc import Iterable
@@ -213,23 +214,6 @@ def _broadcast_tensor(
         output = torch.empty(tensor_shape, device=device, dtype=dtype)
     dist.broadcast(output, src=0, group=group)
     return output
-
-
-def _reference_image_shape(image: Image.Image) -> tuple[int, int]:
-    width, height = image.size
-    if width > 4 * height or height > 4 * width:
-        raise ValueError(f"reference image aspect ratio must be in [1:4, 4:1], got {width}x{height}")
-    scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
-    return (
-        _align_multiple(
-            width * scale,
-            MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
-        ),
-        _align_multiple(
-            height * scale,
-            MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
-        ),
-    )
 
 
 class _SingleRankEncoderGroup:
@@ -1066,18 +1050,30 @@ class MiniMaxH3Pipeline(
         if task == "fl2va":
             prepared_images = [img.resize((width, height), Image.Resampling.LANCZOS) for img in images]
         elif task == "ref2va":
-            # ComfyUI ref_image_size parity: "match" scales references to the
-            # generation canvas (fast); "max" keeps up to a 2048px short edge
-            # (stronger identity, several times slower). Default: match.
+            # ComfyUI ref_image_size parity (comfy_extras/nodes_minimax_h3.py):
+            # both modes are aspect-preserving and shrink-only. "match" scales
+            # references to the generation's pixel area (fast); "max" keeps up
+            # to a 2048px short edge (stronger identity, slower). Default: match.
             ref_image_size = str(extra.get("ref_image_size", "match")).lower()
             if ref_image_size not in ("match", "max"):
                 raise ValueError(f"ref_image_size must be 'match' or 'max', got {ref_image_size!r}")
             for img in images:
+                img_w, img_h = img.size
+                if img_w > 4 * img_h or img_h > 4 * img_w:
+                    raise ValueError(f"reference image aspect ratio must be in [1:4, 4:1], got {img_w}x{img_h}")
                 if ref_image_size == "match":
-                    prepared_images.append(img.resize((width, height), Image.Resampling.LANCZOS))
+                    scale = min(1.0, math.sqrt((width * height) / (img_w * img_h)))
                 else:
-                    ref_width, ref_height = _reference_image_shape(img)
-                    prepared_images.append(img.resize((ref_width, ref_height), Image.Resampling.LANCZOS))
+                    scale = min(1.0, MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(img_w, img_h))
+                ref_width = max(
+                    MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
+                    round(img_w * scale / MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE) * MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
+                )
+                ref_height = max(
+                    MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
+                    round(img_h * scale / MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE) * MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
+                )
+                prepared_images.append(img.resize((ref_width, ref_height), Image.Resampling.LANCZOS))
 
         visual_condition = None
         visual_shape = None

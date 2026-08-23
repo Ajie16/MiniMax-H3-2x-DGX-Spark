@@ -13,7 +13,12 @@
       "sha256_manifest": "turbo4.sha256",
       "source": "lightx2v/Minimax-h3-Turbo",
       "source_file": "minimax_h3_fl2v_turbo_4step_v0.1.safetensors",
-      "notes": "Lab ingest of Diffusers FL2VA turbo 4-step v0.1 (split to_q/to_k/to_v, r=128). --qkv-layout=qkv. Shifts 12/3, NFE=4, 544p training. 768p v1.0 was not present. Do not use minimax_h3_ref2v_turbo_*."
+      "notes": "Lab ingest of Diffusers FL2VA turbo 4-step v0.1 (split to_q/to_k/to_v, r=128). --qkv-layout=qkv. Shifts 12/3, NFE=4, 544p training. 768p v1.0 was not present. Do not use minimax_h3_ref2v_turbo_*. allowed_steps is optional; omit it to fail closed on any steps value other than recommended_steps.",
+      "allowed_steps": [
+        4,
+        6,
+        8
+      ]
     }
   }
 }
