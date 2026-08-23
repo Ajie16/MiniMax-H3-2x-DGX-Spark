@@ -125,6 +125,8 @@ COMMON_ENV=(
   -e RAY_health_check_period_ms=5000
   -e RAY_health_check_timeout_ms=30000
   -e H3_QUANTIZATION="$QUANTIZATION"
+  -e H3_INT8_DEBUG="${H3_INT8_DEBUG:-0}"
+  -e H3_INT8_EAGER="${H3_INT8_EAGER:-0}"
 )
 if [[ "$LORA_MODE" != off ]]; then
   COMMON_ENV+=(

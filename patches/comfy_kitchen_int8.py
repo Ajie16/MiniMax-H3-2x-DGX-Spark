@@ -77,9 +77,16 @@ class ComfyKitchenINT8Config(QuantizationConfig):
     ) -> LinearMethodBase | None:
         del layer  # unused
         # Comfy-Org INT8 checkpoints use convrot_groupsize=256 for attention/MLP
-        # weights and convrot_groupsize=64 for the DiT-block AdaLN projection
-        # (its input dimension 2688 is divisible by 64 but not by 256).
-        group_size = 64 if "adaln_proj.linear" in prefix else 256
+        # weights and convrot_groupsize=64 for the DiT-block and final-layer
+        # AdaLN projections (their input dimension 2688 is divisible by 64 but
+        # not by 256).  Match any module name containing ``adaln_proj``.
+        group_size = 64 if "adaln_proj" in prefix else 256
+        if os.environ.get("H3_INT8_DEBUG") == "1":
+            print(
+                f"[INT8 DEBUG] get_quant_method prefix={prefix} group_size={group_size}",
+                file=sys.stderr,
+                flush=True,
+            )
         return ComfyKitchenINT8LinearMethod(self, group_size=group_size)
 
     def get_scaled_act_names(self) -> list[str]:
