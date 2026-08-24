@@ -151,6 +151,10 @@ execution_args=()
 if [[ "$EXECUTION_MODE" = eager ]]; then
   execution_args+=(--enforce-eager)
 fi
+# Per-stage timings (text encode / vae encode / diffuse / vae decode) come back
+# in the X-Stage-Durations response header; the profiler overhead is a lock
+# plus a dict update per wrapped call, negligible against diffusion steps.
+execution_args+=(--enable-diffusion-pipeline-profiler)
 execution_args_text=""
 if (( ${#execution_args[@]} )); then
   execution_args_text="$(docker_args_text "${execution_args[@]}")"
