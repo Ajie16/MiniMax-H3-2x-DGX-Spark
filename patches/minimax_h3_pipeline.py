@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import math
 import os
@@ -104,7 +105,16 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     if output_type == "latent":
         return output
     if output_type == "np":
-        video = video.detach().float().cpu().permute(0, 2, 3, 4, 1).clamp(0, 1).numpy()
+        # Export uint8 on the GPU instead of float32 [0, 1]: the serving layer
+        # converts float frames back to uint8 with ~5 full CPU passes over the
+        # (F, H, W, 3) buffer (~15 s solo for 243x1344x768, far worse under
+        # swap), while it passes uint8 through with a single stack copy.
+        # Semantics identical to np.round(np.clip(v, 0, 1) * 255) downstream
+        # (both round half to even; verified bit-exact).
+        video = (
+            video.detach().float().mul(255.0).round().clamp(0, 255).to(torch.uint8)
+            .permute(0, 2, 3, 4, 1).contiguous().cpu().numpy()
+        )
         audio = audio.detach().float().cpu().numpy()
         video = [sample for sample in video]
     return {
@@ -233,6 +243,65 @@ class _SingleRankEncoderGroup:
     def __init__(self, rank: int) -> None:
         self.rank_in_group = 0 if rank == 0 else -1
         self.device_group = None
+
+
+def _maybe_torch_profiled(stage: str):
+    """Wrap a pipeline stage with torch.profiler, default off (zero overhead).
+
+    Activated per request by either:
+    - ``H3_TORCH_PROFILER_DIR`` naming an output directory, or
+    - the sentinel file ``/tmp/h3_profiler_on`` existing in the rank's
+      container (output then goes to ``/tmp/h3prof``) — this toggle needs no
+      restart, so it can be switched on for one smoke and removed.
+
+    Each profiled request writes one gzipped chrome trace per rank
+    (hostname/pid in the filename) and logs the top-40 op table by self
+    device time. Profiling makes the wrapped request several times slower —
+    do not leave it on for production runs.
+    """
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            out_dir = os.environ.get("H3_TORCH_PROFILER_DIR", "")
+            if not out_dir and os.path.exists("/tmp/h3_profiler_on"):
+                out_dir = "/tmp/h3prof"
+            if not out_dir:
+                return fn(self, *args, **kwargs)
+            import torch.profiler
+
+            os.makedirs(out_dir, exist_ok=True)
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+            ) as prof:
+                result = fn(self, *args, **kwargs)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            path = os.path.join(
+                out_dir,
+                f"{stage}-{stamp}-{os.uname().nodename}-pid{os.getpid()}.json.gz",
+            )
+            try:  # profiling must never kill a request
+                prof.export_chrome_trace(path)
+                logger.info("torch profiler %s trace written to %s", stage, path)
+            except Exception as exc:
+                logger.warning("torch profiler %s trace export failed: %s", stage, exc)
+            logger.info(
+                "torch profiler %s top-40 ops by self device time:\n%s",
+                stage,
+                prof.key_averages().table(
+                    sort_by="self_device_time_total",
+                    row_limit=40,
+                    max_name_column_width=80,
+                ),
+            )
+            return result
+
+        return wrapper
+
+    return deco
 
 
 class MiniMaxH3Pipeline(
@@ -880,6 +949,7 @@ class MiniMaxH3Pipeline(
         )
         return video_rows, audio_rows
 
+    @_maybe_torch_profiled("diffuse")
     def diffuse(
         self,
         *,

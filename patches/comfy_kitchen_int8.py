@@ -9,8 +9,10 @@ float32 scale.  At runtime it dequantizes the rotated weight to the activation
 dtype and runs a plain GEMM (W8A16) — matching ComfyUI's effective behavior
 when the ref2v LoRA is patched in.  The fused W8A8 kernel
 (``torch.ops.comfy_kitchen.int8_linear``) is available behind
-``H3_INT8_W8A8=1``; it was measured to collapse Ref2VA multi-reference
-generation quality, so W8A16 is the default.
+``H3_INT8_W8A8=1``.  An earlier W8A8 quality collapse turned out to be a
+corrupted INT8 checkpoint, not the kernel: re-validated 2026-08-24 after the
+checkpoint repair (3 images + audio, 832x480, 2 s, 4-step turbo) at 77.0 s
+with quality on par with W8A16.  W8A16 remains the default.
 """
 
 from collections.abc import Iterable, Mapping
@@ -243,8 +245,9 @@ class ComfyKitchenINT8LinearMethod(LinearMethodBase):
         # ~1.3% (W8A8) to ~0.9% (weight-only).  Verified 2026-08-24 on the
         # two-Spark Ref2VA deployment (3 images + audio, 832x480, 2 s,
         # 4-step turbo): correct scene generation, 82.6 s, peak 77.6 GB.
-        # Set H3_INT8_W8A8=1 to use the fused W8A8 kernel instead; it has
-        # not been re-validated since the checkpoint corruption repair.
+        # Set H3_INT8_W8A8=1 to use the fused W8A8 kernel instead;
+        # re-validated 2026-08-24 on the repaired checkpoint (same workflow as
+        # above): 77.0 s, peak 77.0 GB, quality on par with W8A16.
         if os.environ.get("H3_INT8_W8A8") != "1":
             w = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight_dtype(
                 weight,
