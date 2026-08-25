@@ -7,6 +7,7 @@ import json
 import math
 import os
 import tempfile
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, ClassVar
@@ -343,10 +344,49 @@ class MiniMaxH3Pipeline(
         )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
+        self._apply_vae_decode_tuning()
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=(od_config.enable_diffusion_pipeline_profiler)
         )
+
+    def _apply_vae_decode_tuning(self) -> None:
+        """Apply optional env-gated VAE decode tuning knobs.
+
+        Stock decode splits every frame into 256px spatial tiles
+        (``vae_tile_size``) and, because the checkpoint config leaves
+        ``stack_tiling`` unset, decodes them one forward per tile per
+        temporal chunk. On SP2 an 832x480 canvas is 12 tiles = 6
+        sequential decoder forwards per rank per temporal chunk. These
+        knobs trade activation memory for decode latency without editing
+        the checkpoint:
+
+        - ``H3_VAE_DECODER_TILE_SIZE``: pixel-domain decoder tile size
+          (``decoder_tile_size``). Must leave at least ``sp_size`` tiles
+          per decode or the patch-parallel gather fails with "Found
+          empty tasks"; e.g. 512 on an 832x480 canvas gives exactly 2.
+        - ``H3_VAE_DECODER_TILE_OVERLAP``: minimum pixel overlap between
+          decoder tiles (``decoder_tile_overlap_min``).
+        - ``H3_VAE_STACK_TILING=1``: batch each rank's tiles into a
+          single decoder forward per temporal chunk.
+        """
+        model = self.video_vae.model
+        tile_size = os.environ.get("H3_VAE_DECODER_TILE_SIZE", "")
+        if tile_size:
+            model.decoder_tile_size = int(tile_size)
+        tile_overlap = os.environ.get("H3_VAE_DECODER_TILE_OVERLAP", "")
+        if tile_overlap:
+            model.decoder_tile_overlap_min = int(tile_overlap)
+        stack_tiling = os.environ.get("H3_VAE_STACK_TILING", "").lower() in ("1", "true", "yes")
+        if stack_tiling:
+            model.stack_tiling = True
+        if tile_size or tile_overlap or stack_tiling:
+            logger.info(
+                "VAE decode tuning: decoder_tile_size=%d decoder_tile_overlap_min=%d stack_tiling=%s",
+                model.decoder_tile_size,
+                model.decoder_tile_overlap_min,
+                model.stack_tiling,
+            )
 
     def load_weights(
         self,
@@ -1003,14 +1043,25 @@ class MiniMaxH3Pipeline(
         height: int,
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        t_start = time.perf_counter()
         with current_omni_platform.create_autocast_context(
             device_type=self.device.type,
             dtype=torch.float16,
             enabled=True,
         ):
             video = self.video_vae.decode_latent(video_latent)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        t_video = time.perf_counter()
         video = video[..., :height, :width].contiguous()
         audio = self.audio_vae.decode_latent(audio_latent)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        logger.info(
+            "VAE decode split: video=%.2fs audio=%.2fs",
+            t_video - t_start,
+            time.perf_counter() - t_video,
+        )
         return video, audio
 
     @torch.no_grad()
