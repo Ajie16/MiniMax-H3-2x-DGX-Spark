@@ -996,6 +996,19 @@ class MiniMaxH3DiTModel(nn.Module):
                 loaded_weight,
                 arch=self.arch,
             )
+            # GB10 workaround: params are already CUDA-resident here, and a
+            # pageable H2D copy_ from safetensors' zero-copy mmap views runs
+            # at only ~150-200 MiB/s on this platform (driver staging against
+            # file-backed pages; cold or warm page cache alike) — the 32 GiB
+            # DiT shard took ~222 s at startup. Landing the view in anonymous
+            # CPU memory first (~15 GB/s) and then uploading (~10 GB/s) cuts
+            # the phase to a few seconds. Measured 2026-08-26 on spark-0d97.
+            if (
+                loaded_weight.device.type == "cpu"
+                and param.device.type == "cuda"
+                and loaded_weight._is_view()
+            ):
+                loaded_weight = loaded_weight.clone()
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded.add(name)
