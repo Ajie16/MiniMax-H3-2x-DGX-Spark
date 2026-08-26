@@ -105,16 +105,20 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     if output_type == "latent":
         return output
     if output_type == "np":
-        # Export uint8 on the GPU instead of float32 [0, 1]: the serving layer
-        # converts float frames back to uint8 with ~5 full CPU passes over the
-        # (F, H, W, 3) buffer (~15 s solo for 243x1344x768, far worse under
-        # swap), while it passes uint8 through with a single stack copy.
-        # Semantics identical to np.round(np.clip(v, 0, 1) * 255) downstream
-        # (both round half to even; verified bit-exact).
-        video = (
-            video.detach().float().mul(255.0).round().clamp(0, 255).to(torch.uint8)
-            .permute(0, 2, 3, 4, 1).contiguous().cpu().numpy()
-        )
+        # The pipeline now exports uint8 on the GPU worker-side (see
+        # MiniMaxH3Pipeline.decode), so the fp32 (1,3,F,H,W) tensor no longer
+        # crosses _move_tensors_to_cpu + Ray pickle/plasma — 4x smaller payload
+        # and no CPU-side float->uint8 chain here. Keep the legacy conversion
+        # as a fallback for callers that hand us an unconverted tensor.
+        if isinstance(video, torch.Tensor) and video.dtype == torch.uint8:
+            video = video.cpu().numpy()
+        else:
+            # Legacy path semantics: np.round(np.clip(v, 0, 1) * 255)
+            # (both round half to even; verified bit-exact).
+            video = (
+                video.detach().float().mul(255.0).round().clamp(0, 255).to(torch.uint8)
+                .permute(0, 2, 3, 4, 1).contiguous().cpu().numpy()
+            )
         audio = audio.detach().float().cpu().numpy()
         video = [sample for sample in video]
     return {
@@ -1105,6 +1109,7 @@ class MiniMaxH3Pipeline(
         )
         return video_latent, audio_latent
 
+    @_maybe_torch_profiled("decode")
     def decode(
         self,
         video_latent: torch.Tensor,
@@ -1127,10 +1132,23 @@ class MiniMaxH3Pipeline(
         audio = self.audio_vae.decode_latent(audio_latent)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
+        t_audio = time.perf_counter()
+        # Export uint8 on the GPU here, worker-side, so the fp32
+        # (1,3,F,H,W) tensor never crosses _move_tensors_to_cpu + Ray
+        # pickle/plasma: 4x smaller payload, and the API-side post_process
+        # degenerates to a numpy view. Same op chain as the legacy
+        # _minimax_h3_post_process float path (verified bit-exact).
+        video = (
+            video.detach().float().mul(255.0).round().clamp(0, 255).to(torch.uint8)
+            .permute(0, 2, 3, 4, 1).contiguous()
+        )
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
         logger.info(
-            "VAE decode split: video=%.2fs audio=%.2fs",
+            "VAE decode split: video=%.2fs audio=%.2fs export=%.2fs",
             t_video - t_start,
-            time.perf_counter() - t_video,
+            t_audio - t_video,
+            time.perf_counter() - t_audio,
         )
         return video, audio
 
