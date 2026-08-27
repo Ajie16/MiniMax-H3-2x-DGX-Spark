@@ -42,8 +42,8 @@ host is the second Spark:
 
 | Role | Host | Fabric address | Distributed rank | Memory after load |
 |---|---|---:|---:|---:|
-| API / rank 0 (encoders, VAE, output) | `xujie2` / `spark-ac8f` | 10.100.65.1 | 0 | ~97 GiB used |
-| rank 1 (DiT half) | local / `spark-0d97` | 10.100.65.2 | 1 | ~48 GiB used |
+| API / rank 0 (encoders, VAE, output) | `xujie2` / `spark-ac8f` | 10.100.65.1 | 0 | ~80 GiB used |
+| rank 1 (DiT half) | local / `spark-0d97` | 10.100.65.2 | 1 | ~60 GiB used |
 
 - API base: `http://10.100.65.1:8000/v1`; Ray dashboard:
   `http://10.100.65.1:8265` (private fabric only, no auth by design).
@@ -54,7 +54,7 @@ host is the second Spark:
   ID is not reproducible across machines because Docker image IDs embed build
   metadata; upstream digest, layer ancestry, and runtime versions are still
   verified fail-closed). The service image
-  `minimax-h3-2x-dgx-spark:experimental` is `sha256:81001bb2…` and identical
+  `minimax-h3-2x-dgx-spark:experimental` is `sha256:02d75101…` and identical
   on both nodes.
 - Build on this cluster needs host networking and a reachable PyPI mirror:
 
@@ -71,9 +71,9 @@ host is the second Spark:
 - The model is byte-identical on both nodes (81/81 files SHA-256 match,
   ~135 GiB). `ffmpeg`/`ffprobe` are installed on the local host for
   `make smoke` / `make verify`.
-- Operational instructions are packaged as the Codex skill
+- Operational instructions are packaged as the agent skill
   `dgx-spark-2x-h3-api` (startup, usage, rebuild, troubleshooting), see
-  `~/.codex/skills/dgx-spark-2x-h3-api`.
+  `~/.kimi-code/skills/dgx-spark-2x-h3-api`.
 
 ### Ref2VA multi-reference inputs (2026-08-22)
 
@@ -107,6 +107,88 @@ the upstream single-reference rules).
   example 768x768, or up to 992x992, 32-aligned and still within the model's
   native ~1.03MP canvas cap) without any aspect distortion; `max` preserves
   the reference aspect ratio regardless of the canvas.
+
+## Fork optimizations over upstream
+
+The pinned upstream recipe serves FL2VA T2VA with online FP8 and lazy
+regional compile. This fork has since moved the live service to **Ref2VA
+with a resident turbo LoRA and INT8 weights**, and fixed several measured
+hot spots. All numbers below are single-lab measurements on this two-Spark
+cluster (SM121, eager, CUDNN_ATTN), not vendor claims.
+
+### Serving profile
+
+- **Catalogued LoRA serving on both ranks**: the `ref2v` turbo adapter
+  (rank 384, 208 modules) is loaded statically at startup from a per-host
+  catalog; `allowed_steps` is {4, 6, 8} with 4 as the default
+  (`flow_shift=12`, `audio_flow_shift=3`).
+- **INT8 ConvRot DiT weights**: a comfy-kitchen `LinearMethodBase`
+  (`patches/comfy_kitchen_int8.py`) loads the Comfy-Org pre-quantized
+  checkpoint (int8 qdata + per-row fp32 scales). DiT weight memory halves;
+  peak request memory drops from ~99.5 GiB (BF16 with `max` refs) to
+  ~77 GiB, with speed on par with BF16 on SM121. W8A16 (dequant + plain
+  GEMM, ComfyUI-with-LoRA parity) is the default; the fused W8A8 kernel is
+  available via `H3_INT8_W8A8=1` (validated on the 3-image `max` workflow:
+  77.0 s vs 82.6 s W8A16, quality on par).
+- **compile stays off on two-Spark**: regional compile does not exclude the
+  Ulysses SP2 all-to-alls; the first compiled request brings up a new NCCL
+  communicator mid-step, the ranks mismatch on collectives, and the inline
+  executor dies (measured 2026-08-24). The fork serves `eager` until compile
+  is taught to leave the all-to-alls outside compiled regions.
+
+### Latency
+
+- **Text encoder TP2**: the Qwen3-VL encoder is sharded across both ranks
+  (`H3_TEXT_ENCODER_TP_SIZE=2`), cutting the rank-0 peak from 101.5 to
+  ~74 GiB and balancing both hosts near ~80 GiB used.
+- **Async MP4 encode**: video encoding runs in a worker thread; `/health`
+  stayed under 15 ms during encode (previously the API event loop blocked
+  for tens of seconds under swap pressure).
+- **VAE decode stack tiling** (`H3_VAE_STACK_TILING=1`): each rank's 256 px
+  spatial tiles batch into one decoder forward per temporal chunk. 10 s /
+  832×480 decode 36.1→**21.9 s** (request total 162.8→148.7 s); 2 s decode
+  5.7→3.8 s; frames verified visually identical. Raising the decoder tile
+  size to 512 was rejected: faster (15.8 s) but full-canvas grid artifacts
+  (the decoder was trained on 256 px tiles).
+- **Worker-side uint8 export**: frames are converted to uint8 on the GPU
+  inside `decode()` (same op chain as the legacy float path, verified
+  bit-exact) instead of crossing Ray pickle/plasma as fp32 — the 10 s /
+  832×480 payload shrinks 4× (1.16 GiB → 291 MiB) and the result tail
+  (forward end → API result) dropped from 1–8.4 s (high variance under
+  memory pressure) to **~1.5 s**.
+- **Per-stage observability**: every response carries an
+  `X-Stage-Durations` header (`encode_prompt` / `diffuse` / `decode`), and
+  an opt-in torch.profiler hook covers `diffuse()` and `decode()`
+  (`H3_TORCH_PROFILER_DIR` or the `/tmp/h3_profiler_on` sentinel). Current
+  10 s / 832×480 / 3-ref breakdown: encode_prompt 2.7 s, diffuse 111.9 s,
+  decode 22.0 s, tail ~1.5 s, MP4 encode 1.3 s.
+
+### Cold start
+
+- **mmap→anon bounce before CUDA upload**: pageable H2D copies from
+  safetensors' zero-copy mmap views run at only ~150–200 MiB/s on GB10
+  (single-core, independent of page-cache temperature), so the 32 GiB INT8
+  DiT shard took 222.84 s to load. `patches/minimax_h3_transformer.py` now
+  clones each CPU view into anonymous memory first (~15 GB/s) and then
+  uploads (~10.8 GB/s), composing to ~6.9 GB/s: DiT weight load
+  222.84→**16.76 s**, launch→ready **~10 min → ~4.3 min**.
+
+### ComfyUI output parity
+
+- **Reference VAE encode** conditions on the VAE posterior mean in FP32
+  instead of a sampled, FP16-quantized latent
+  (`patches/ref-encode-posterior-mean.patch`).
+- **Qwen vision tower computes in FP32** (`patches/vision-tower-fp32.patch`);
+  bf16 rounding there visibly blurred fine reference textures (buildings)
+  while faces stayed fine.
+
+### Current measured numbers (INT8 W8A8, eager, image `02d75101`)
+
+| Workload | Total | Peak memory |
+|---|---:|---:|
+| 768×448 / 2 s / 1 image + audio / `match` / 4-step | 25.7 s | 75.9 GiB |
+| 832×480 / 2 s / 3 images + audio / `max` / 4-step | 77.0 s | 77.0 GiB |
+| 832×480 / 10 s / 3 images + audio / `match` / 4-step | 142.0 s | ~80 GiB |
 
 ## Verified results
 
@@ -202,15 +284,17 @@ derived image IDs match. The accepted companion commit, upstream digest, local
 base image ID, and exact runtime package versions are recorded in
 [the reproducibility guide](docs/REPRODUCIBILITY.md).
 
-Cold readiness measured 584.91 to 588.98 seconds in the final acceptance.
+Cold readiness measured 584.91 to 588.98 seconds in the final (FL2VA-era)
+acceptance; the current Ref2VA INT8 eager profile cold-starts in ~4.3 min.
 `wait-ready.sh` waits through model loading and then checks both Ray nodes,
 HTTP health, all three containers, and exact model identity. The API is served
 only on the configured private head-node address on port `8000`; synchronous
 generation uses `POST /v1/videos/sync`.
 
-The default fast profile compiles lazily. Treat the first successful request
-after a cold start as warm-up and measure steady-state latency from the second
-request onward.
+The upstream default fast profile compiles lazily; **this fork serves `eager`
+because regional compile breaks the two-rank Ulysses path** (see "Fork
+optimizations over upstream"). With eager there is no compile warm-up request;
+first and second requests run at similar speed.
 
 The default launcher keeps cross-step caching off for maximum fidelity. To
 start the measured balanced Cache-DiT profile instead:
